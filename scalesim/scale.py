@@ -33,6 +33,10 @@ if __name__ == '__main__':
                         default="Y",
                         help="Save Trace: (Y/N)"
                         )
+    parser.add_argument('-n', metavar='num workers', type=int,
+                        default=1,
+                        help="Number of parallel layer workers (default: 1)"
+                        )
 
     args = parser.parse_args()
     topology = args.t
@@ -41,6 +45,7 @@ if __name__ == '__main__':
     logpath = args.p
     inp_type = args.i
     save_trace = args.s
+    num_workers = args.n
 
     GEMM_INPUT = False
     if inp_type == 'gemm':
@@ -57,6 +62,7 @@ if __name__ == '__main__':
                  config=config,
                  topology=topology,
                  layout=layout,
-                 input_type_gemm=GEMM_INPUT
+                 input_type_gemm=GEMM_INPUT,
+                 num_workers=num_workers
                  )
     s.run_scale(top_path=logpath)

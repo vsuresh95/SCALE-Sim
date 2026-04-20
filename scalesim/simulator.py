@@ -4,12 +4,19 @@ This file contains the 'simulator' class that simulates the entire model using t
 """
 
 import os
+from multiprocessing import Pool
 
 from scalesim.scale_config import scale_config as cfg
 from scalesim.topology_utils import topologies as topo
 from scalesim.layout_utils import layouts as layout
 from scalesim.single_layer_sim import single_layer_sim as layer_sim
 from scalesim.linear_model.tpu import tpuv4_linear_model, tpuv5e_linear_model, tpuv6e_linear_model
+
+
+def _run_layer_worker(layer_obj):
+    """Module-level function so multiprocessing can pickle it."""
+    layer_obj.run()
+    return layer_obj
 
 
 class simulator:
@@ -28,6 +35,7 @@ class simulator:
         self.top_path = "./"
         self.verbose = True
         self.save_trace = True
+        self.num_workers = 1
 
         self.num_layers = 0
 
@@ -43,7 +51,8 @@ class simulator:
                    layout_obj=layout(),
                    top_path="./",
                    verbosity=True,
-                   save_trace=True
+                   save_trace=True,
+                   num_workers=1
                    ):
         """
         Method to set the run parameters including inputs and parameters for housekeeping.
@@ -55,6 +64,7 @@ class simulator:
         self.top_path = top_path
         self.verbose = verbosity
         self.save_trace = save_trace
+        self.num_workers = num_workers
 
         # Calculate inferrable parameters here
         self.num_layers = self.topo.get_num_layers()
@@ -93,68 +103,69 @@ class simulator:
 
         self.top_path = report_path
 
-        # 2. Run each layer
-        # TODO: This is parallelizable
-        for single_layer_obj in self.single_layer_sim_object_list:
-
+        # 2. Run each layer — parallel if num_workers > 1
+        if self.num_workers > 1:
+            workers = min(self.num_workers, self.num_layers)
             if self.verbose:
-                layer_id = single_layer_obj.get_layer_id()
-                print('\nRunning Layer ' + str(layer_id))
-
-            single_layer_obj.run()
-
-            if self.verbose:
-                comp_items = single_layer_obj.get_compute_report_items()
-                total_cycles = comp_items[0]
-                comp_cycles = comp_items[1]
-                stall_cycles = comp_items[2]
-                util = comp_items[3]
-                mapping_eff = comp_items[4]
-                print('Total cycles: ' + str(total_cycles))
-                print('Compute cycles: ' + str(comp_cycles))
-                print('Stall cycles: ' + str(stall_cycles))
-                print('Overall utilization: ' + "{:.2f}".format(util) +'%')
-                print('Mapping efficiency: ' + "{:.2f}".format(mapping_eff) +'%')
-
-                avg_bw_items = single_layer_obj.get_bandwidth_report_items()
-                if self.conf.sparsity_support is True:
-                    avg_ifmap_sram_bw = avg_bw_items[0]
-                    avg_filter_sram_bw = avg_bw_items[1]
-                    avg_filter_metadata_sram_bw = avg_bw_items[2]
-                    avg_ofmap_sram_bw = avg_bw_items[3]
-                    avg_ifmap_dram_bw = avg_bw_items[4]
-                    avg_filter_dram_bw = avg_bw_items[5]
-                    avg_ofmap_dram_bw = avg_bw_items[6]
-                else:
-                    avg_ifmap_sram_bw = avg_bw_items[0]
-                    avg_filter_sram_bw = avg_bw_items[1]
-                    avg_ofmap_sram_bw = avg_bw_items[2]
-                    avg_ifmap_dram_bw = avg_bw_items[3]
-                    avg_filter_dram_bw = avg_bw_items[4]
-                    avg_ofmap_dram_bw = avg_bw_items[5]
-
-                print('Average IFMAP SRAM BW: ' + "{:.3f}".format(avg_ifmap_sram_bw) + \
-                      ' words/cycle')
-                print('Average Filter SRAM BW: ' + "{:.3f}".format(avg_filter_sram_bw) + \
-                      ' words/cycle')
-                if self.conf.sparsity_support is True:
-                    print('Average Filter Metadata SRAM BW: ' + \
-                          "{:.3f}".format(avg_filter_metadata_sram_bw) + ' words/cycle')
-                print('Average OFMAP SRAM BW: ' + "{:.3f}".format(avg_ofmap_sram_bw) + \
-                      ' words/cycle')
-                print('Average IFMAP DRAM BW: ' + "{:.3f}".format(avg_ifmap_dram_bw) + \
-                      ' words/cycle')
-                print('Average Filter DRAM BW: ' + "{:.3f}".format(avg_filter_dram_bw) + \
-                      ' words/cycle')
-                print('Average OFMAP DRAM BW: ' + "{:.3f}".format(avg_ofmap_dram_bw) + \
-                      ' words/cycle')
-
-            if self.save_trace:
+                print(f'Running {self.num_layers} layers across {workers} workers')
+            with Pool(processes=workers) as pool:
+                self.single_layer_sim_object_list = pool.map(
+                    _run_layer_worker, self.single_layer_sim_object_list
+                )
+        else:
+            for single_layer_obj in self.single_layer_sim_object_list:
                 if self.verbose:
-                    print('Saving traces: ', end='')
+                    print('\nRunning Layer ' + str(single_layer_obj.get_layer_id()))
+                single_layer_obj.run()
+                if self.verbose:
+                    comp_items = single_layer_obj.get_compute_report_items()
+                    total_cycles = comp_items[0]
+                    comp_cycles = comp_items[1]
+                    stall_cycles = comp_items[2]
+                    util = comp_items[3]
+                    mapping_eff = comp_items[4]
+                    print('Total cycles: ' + str(total_cycles))
+                    print('Compute cycles: ' + str(comp_cycles))
+                    print('Stall cycles: ' + str(stall_cycles))
+                    print('Overall utilization: ' + "{:.2f}".format(util) +'%')
+                    print('Mapping efficiency: ' + "{:.2f}".format(mapping_eff) +'%')
+
+                    avg_bw_items = single_layer_obj.get_bandwidth_report_items()
+                    if self.conf.sparsity_support is True:
+                        avg_ifmap_sram_bw = avg_bw_items[0]
+                        avg_filter_sram_bw = avg_bw_items[1]
+                        avg_filter_metadata_sram_bw = avg_bw_items[2]
+                        avg_ofmap_sram_bw = avg_bw_items[3]
+                        avg_ifmap_dram_bw = avg_bw_items[4]
+                        avg_filter_dram_bw = avg_bw_items[5]
+                        avg_ofmap_dram_bw = avg_bw_items[6]
+                    else:
+                        avg_ifmap_sram_bw = avg_bw_items[0]
+                        avg_filter_sram_bw = avg_bw_items[1]
+                        avg_ofmap_sram_bw = avg_bw_items[2]
+                        avg_ifmap_dram_bw = avg_bw_items[3]
+                        avg_filter_dram_bw = avg_bw_items[4]
+                        avg_ofmap_dram_bw = avg_bw_items[5]
+
+                    print('Average IFMAP SRAM BW: ' + "{:.3f}".format(avg_ifmap_sram_bw) + \
+                          ' words/cycle')
+                    print('Average Filter SRAM BW: ' + "{:.3f}".format(avg_filter_sram_bw) + \
+                          ' words/cycle')
+                    if self.conf.sparsity_support is True:
+                        print('Average Filter Metadata SRAM BW: ' + \
+                              "{:.3f}".format(avg_filter_metadata_sram_bw) + ' words/cycle')
+                    print('Average OFMAP SRAM BW: ' + "{:.3f}".format(avg_ofmap_sram_bw) + \
+                          ' words/cycle')
+                    print('Average IFMAP DRAM BW: ' + "{:.3f}".format(avg_ifmap_dram_bw) + \
+                          ' words/cycle')
+                    print('Average Filter DRAM BW: ' + "{:.3f}".format(avg_filter_dram_bw) + \
+                          ' words/cycle')
+                    print('Average OFMAP DRAM BW: ' + "{:.3f}".format(avg_ofmap_dram_bw) + \
+                          ' words/cycle')
+
+        if self.save_trace:
+            for single_layer_obj in self.single_layer_sim_object_list:
                 single_layer_obj.save_traces(self.top_path)
-                if self.verbose:
-                    print('Done!')
 
         self.all_layer_run_done = True
 

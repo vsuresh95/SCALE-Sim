@@ -22,7 +22,8 @@ class scalesim:
                  config='',
                  topology='',
                  layout='',
-                 input_type_gemm=False):
+                 input_type_gemm=False,
+                 num_workers=1):
         """
         __init__ method
         """
@@ -44,6 +45,7 @@ class scalesim:
         self.read_gemm_inputs = input_type_gemm
         self.save_space = save_disk_space
         self.verbose_flag = verbose
+        self.num_workers = num_workers
         self.run_done_flag = False
         self.logs_generated_flag = False
 
@@ -121,7 +123,8 @@ class scalesim:
             layout_obj=self.layout,
             top_path=self.top_path,
             verbosity=self.verbose_flag,
-            save_trace=save_trace
+            save_trace=save_trace,
+            num_workers=self.num_workers
         )
         self.run_once()
 
