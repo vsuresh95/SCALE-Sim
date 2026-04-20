@@ -27,3 +27,4 @@ test*
 configs_test
 benchmark_results
 results/
+fig_*
