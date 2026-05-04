@@ -28,3 +28,4 @@ configs_test
 benchmark_results
 results/
 fig_*
+outputs/*

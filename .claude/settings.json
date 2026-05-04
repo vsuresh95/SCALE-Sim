@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//proc/**)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -m scalesim.scale -c configs/scale_16.cfg -t topologies/conv_nets/Resnet50.csv -p /tmp/scalesim_test/ -s N -n 1)",
+      "Bash(python3 -m scalesim.scale -c configs/scale_16.cfg -t topologies/xrbench/hand_pose.csv -p /tmp/scalesim_test/ -s N -n 1)",
+      "Read(//tmp/scalesim_test/scale_example_run_32x32_ws/**)"
+    ]
+  }
+}
