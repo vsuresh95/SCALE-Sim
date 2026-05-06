@@ -1,7 +1,7 @@
 {
   "name": "xrbench_7model",
   "duration_s": 10.0,
-  "cycles_per_second": 100000000,
+  "cycles_per_second": 200000000,
   "deadline_scale": 1.0,
   "jitter_fraction": 0.2,
   "random_seed": 0,

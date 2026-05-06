@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("analysis/scheduler_outputs"),
+        default=Path("outputs/scheduler_outputs"),
         help="Directory where trace and summary CSVs are written.",
     )
     parser.add_argument(
@@ -490,6 +490,84 @@ def write_summary_csv(
         )
 
 
+def write_model_logs(
+    scheduled: List[ScheduledRequest],
+    requests: List[Request],
+    output_dir: Path,
+    output_prefix: str,
+    scenario_name: str,
+    policy: str,
+    hardware: str,
+    cycles_per_second: int,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Index simulation results by request_id for O(1) lookup
+    result_by_id: Dict[int, ScheduledRequest] = {item.request.request_id: item for item in scheduled}
+
+    # Group requests by model
+    models: Dict[str, List[Request]] = {}
+    for req in requests:
+        models.setdefault(req.model, []).append(req)
+
+    def _cy(cycles: int) -> str:
+        return f"{cycles_to_seconds(cycles, cycles_per_second)*1000:.3f}ms"
+
+    for model, reqs in sorted(models.items()):
+        log_path = output_dir / f"{output_prefix}_{model}_log.txt"
+        misses = sum(1 for r in reqs if result_by_id[r.request_id].finish_cycle > r.deadline_cycle)
+
+        with log_path.open("w") as f:
+            # Header
+            f.write("=" * 80 + "\n")
+            f.write(f"  MODEL        : {model}\n")
+            f.write(f"  SCENARIO     : {scenario_name}\n")
+            f.write(f"  HARDWARE     : {hardware}\n")
+            f.write(f"  POLICY       : {policy}\n")
+            f.write(f"  CLOCK        : {cycles_per_second/1e6:.0f} MHz\n")
+            f.write(f"  TOTAL REQS   : {len(reqs)}\n")
+            f.write(f"  DEADLINE MISS: {misses} / {len(reqs)} ({misses/len(reqs)*100:.1f}%)\n")
+            first = reqs[0]
+            f.write(f"  SERVICE TIME : {_cy(first.service_cycles)}\n")
+            f.write(f"  DEADLINE WIN : {_cy(int(first.deadline_scale * cycles_per_second / first.fps))}\n")
+            f.write("=" * 80 + "\n\n")
+
+            # Request trace
+            f.write("--- REQUEST TRACE ---\n")
+            max_finish = max((result_by_id[r.request_id].finish_cycle for r in reqs), default=0)
+            cy_w = max(14, len(_cy(max_finish)))
+            hdr = (f"{'req_id':>7}  {'release':>{cy_w}}  {'deadline':>{cy_w}}  "
+                   f"{'worker':>6}  {'start':>{cy_w}}  {'finish':>{cy_w}}  "
+                   f"{'wait':>{cy_w}}  {'slack@dispatch(ms)':>19}  {'miss':>4}\n")
+            f.write(hdr)
+            f.write("-" * len(hdr.rstrip()) + "\n")
+
+            for req in sorted(reqs, key=lambda r: r.release_cycle):
+                item = result_by_id[req.request_id]
+                wait = item.start_cycle - req.release_cycle
+                miss = item.finish_cycle > req.deadline_cycle
+                f.write(
+                    f"{req.request_id:>7}  "
+                    f"{_cy(req.release_cycle):>{cy_w}}  "
+                    f"{_cy(req.deadline_cycle):>{cy_w}}  "
+                    f"{item.worker_id:>6}  "
+                    f"{_cy(item.start_cycle):>{cy_w}}  "
+                    f"{_cy(item.finish_cycle):>{cy_w}}  "
+                    f"{_cy(wait):>{cy_w}}  "
+                    f"{cycles_to_seconds(item.slack_at_dispatch, cycles_per_second)*1000:>+16.3f}ms  "
+                    f"{'MISS' if miss else 'ok':>4}\n"
+                )
+
+            # Per-model summary stats
+            waits = [result_by_id[r.request_id].start_cycle - r.release_cycle for r in reqs]
+            responses = [result_by_id[r.request_id].finish_cycle - r.release_cycle for r in reqs]
+            f.write("\n--- MODEL SUMMARY ---\n")
+            f.write(f"  mean wait    : {_cy(int(sum(waits)/len(waits)))}\n")
+            f.write(f"  max wait     : {_cy(max(waits))}\n")
+            f.write(f"  mean response: {_cy(int(sum(responses)/len(responses)))}\n")
+            f.write(f"  max response : {_cy(max(responses))}\n")
+
+
 def print_run_summary(
     summary: Dict[str, float],
     scenario_name: str,
@@ -525,6 +603,8 @@ def main() -> int:
 
     write_trace_csv(scheduled, trace_path, cycles_per_second)
     write_summary_csv(summary, summary_path, scenario_name, args.policy, args.hardware, cycles_per_second)
+    write_model_logs(scheduled, requests, args.output_dir, output_prefix,
+                     scenario_name, args.policy, args.hardware, cycles_per_second)
     print_run_summary(summary, scenario_name, args.policy, args.hardware, trace_path, summary_path)
     return 0
 
