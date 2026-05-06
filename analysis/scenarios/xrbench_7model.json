@@ -15,11 +15,11 @@
       "task_priority": 1
     },
     "key_res15": {
-      "fps": 30,
+      "fps": 10,
       "task_priority": 1
     },
     "tcn": {
-      "fps": 3,
+      "fps": 30,
       "task_priority": 1
     },
     "d2go": {
@@ -27,11 +27,11 @@
       "task_priority": 1
     },
     "emformer": {
-      "fps": 25,
+      "fps": 10,
       "task_priority": 1
     },
     "deit_small": {
-      "fps": 30,
+      "fps": 10,
       "task_priority": 1
     }
   }
