@@ -1,0 +1,38 @@
+{
+  "name": "xrbench_7model",
+  "duration_s": 10.0,
+  "cycles_per_second": 100000000,
+  "deadline_scale": 1.0,
+  "jitter_fraction": 0.2,
+  "random_seed": 0,
+  "tasks": {
+    "eyecod": {
+      "fps": 60,
+      "task_priority": 1
+    },
+    "hand_pose": {
+      "fps": 30,
+      "task_priority": 1
+    },
+    "key_res15": {
+      "fps": 30,
+      "task_priority": 1
+    },
+    "tcn": {
+      "fps": 3,
+      "task_priority": 1
+    },
+    "d2go": {
+      "fps": 30,
+      "task_priority": 1
+    },
+    "emformer": {
+      "fps": 25,
+      "task_priority": 1
+    },
+    "deit_small": {
+      "fps": 30,
+      "task_priority": 1
+    }
+  }
+}
