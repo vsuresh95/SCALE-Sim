@@ -23,6 +23,8 @@ HARDWARE_CONFIGS = {
 }
 
 SUPPORTED_POLICIES = {"fifo", "lpt", "deadline_task_aware"}
+SUPPORTED_ALLOC = {"greedy", "fair"}
+SA_SIZE_FROM_LATENCY = {"lat_128": 128, "lat_64": 64, "lat_32": 32, "lat_16": 16}
 
 
 @dataclass
@@ -44,6 +46,22 @@ class ScheduledRequest:
     start_cycle: int
     finish_cycle: int
     slack_at_dispatch: int
+
+
+@dataclass
+class LayerSpec:
+    fold_count: int
+    fold_cycles: float  # mean cycles per fold
+
+
+@dataclass
+class ActiveJob:
+    request: Request
+    layer_specs: List[LayerSpec]
+    current_layer_idx: int = 0
+    job_start_cycle: int = 0
+    layer_start_cycle: int = 0
+    n_arrays: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,8 +99,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--results-root",
         type=Path,
-        default=Path("outputs/xrbench"),
-        help="XRBench results root used if the service summary CSV must be rebuilt.",
+        default=Path("outputs/xrbench_5_06"),
+        help="XRBench results root containing FOLD_REPORT.csv outputs.",
+    )
+    parser.add_argument(
+        "--alloc",
+        choices=sorted(SUPPORTED_ALLOC),
+        default="greedy",
+        help="Array allocation policy for layer-granularity scheduler.",
     )
     parser.add_argument(
         "--quiet",
@@ -263,6 +287,36 @@ def cycles_to_seconds(cycles: int, cycles_per_second: int) -> float:
     return cycles / float(cycles_per_second)
 
 
+def load_fold_specs(results_root: Path, model: str, sa_size: int) -> Optional[List[LayerSpec]]:
+    """Load per-layer LayerSpec list from FOLD_REPORT.csv for a given model and SA size."""
+    path = results_root / model / f"sa{sa_size}" / f"scale_{sa_size}x{sa_size}_os" / "FOLD_REPORT.csv"
+    if not path.exists():
+        return None
+    layer_data: Dict[int, List[float]] = {}
+    try:
+        with path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            reader.fieldnames = [f.strip() for f in reader.fieldnames]
+            for row in reader:
+                lid = int(row["LayerID"].strip())
+                cyc = float(row["Cycles"].strip())
+                layer_data.setdefault(lid, []).append(cyc)
+    except (KeyError, ValueError):
+        return None
+    if not layer_data:
+        return None
+    specs = []
+    for lid in sorted(layer_data.keys()):
+        folds = layer_data[lid]
+        specs.append(LayerSpec(fold_count=len(folds), fold_cycles=sum(folds) / len(folds)))
+    return specs
+
+
+def layer_time(spec: LayerSpec, n_arrays: int) -> float:
+    """Cycles to execute one layer on n_arrays arrays in parallel."""
+    return math.ceil(spec.fold_count / n_arrays) * spec.fold_cycles
+
+
 def select_request(policy: str, waiting: List[Request], current_cycle: int) -> Request:
     if policy == "fifo":
         return min(waiting, key=lambda req: (req.release_cycle, req.request_id))
@@ -330,6 +384,141 @@ def simulate_scheduler(
 
         if pending_times:
             current_cycle = min(pending_times)
+        else:
+            break
+
+    final_cycle = max((item.finish_cycle for item in scheduled), default=0)
+    scheduled.sort(key=lambda item: item.request.request_id)
+    return scheduled, final_cycle
+
+
+def select_active_job(policy: str, ready: List[ActiveJob], current_cycle: int) -> ActiveJob:
+    """Select next job from the layer-scheduler ready queue using the given policy."""
+    if policy == "fifo":
+        return min(ready, key=lambda j: (j.request.release_cycle, j.request.request_id))
+    if policy == "lpt":
+        return min(ready, key=lambda j: (-j.request.service_cycles, j.request.release_cycle, j.request.request_id))
+    if policy == "deadline_task_aware":
+        return min(
+            ready,
+            key=lambda j: (
+                j.request.deadline_cycle - current_cycle - j.request.service_cycles,
+                j.request.deadline_cycle,
+                -j.request.task_priority,
+                -j.request.service_cycles,
+                j.request.release_cycle,
+                j.request.request_id,
+            ),
+        )
+    raise ValueError(f"unsupported policy: {policy}")
+
+
+def simulate_scheduler_layer(
+    requests: List[Request],
+    fold_specs_table: Dict[str, List[LayerSpec]],
+    num_workers: int,
+    policy: str,
+    alloc: str,
+) -> Tuple[List[ScheduledRequest], int]:
+    """Layer-granularity scheduler: allocate arrays dynamically at each layer boundary."""
+    requests_by_release = sorted(requests, key=lambda r: (r.release_cycle, r.request_id))
+    arrival_idx = 0
+
+    free_arrays = num_workers
+    ready_queue: List[ActiveJob] = []
+    active_jobs: List[Tuple[int, ActiveJob]] = []  # (finish_cycle, job)
+    scheduled: List[ScheduledRequest] = []
+    current_cycle = 0
+
+    def _start_layer(job: ActiveJob, n: int) -> None:
+        nonlocal free_arrays
+        spec = job.layer_specs[job.current_layer_idx]
+        n = min(n, spec.fold_count)  # cap at useful amount
+        free_arrays -= n
+        if job.current_layer_idx == 0:
+            job.job_start_cycle = current_cycle
+        job.layer_start_cycle = current_cycle
+        job.n_arrays = n
+        finish = current_cycle + int(math.ceil(layer_time(spec, n)))
+        active_jobs.append((finish, job))
+
+    def _dispatch() -> None:
+        if not ready_queue or free_arrays == 0:
+            return
+        if alloc == "greedy":
+            tmp = list(ready_queue)
+            while tmp and free_arrays > 0:
+                job = select_active_job(policy, tmp, current_cycle)
+                tmp.remove(job)
+                ready_queue.remove(job)
+                n = free_arrays  # give all remaining (capped inside _start_layer)
+                _start_layer(job, n)
+        else:  # fair
+            n_dispatch = min(len(ready_queue), free_arrays)
+            if n_dispatch == 0:
+                return
+            tmp = list(ready_queue)
+            jobs_to_start = []
+            for _ in range(n_dispatch):
+                job = select_active_job(policy, tmp, current_cycle)
+                tmp.remove(job)
+                jobs_to_start.append(job)
+            base = free_arrays // len(jobs_to_start)
+            extra = free_arrays % len(jobs_to_start)
+            for i, job in enumerate(jobs_to_start):
+                ready_queue.remove(job)
+                n = base + (1 if i < extra else 0)
+                _start_layer(job, n)
+
+    while arrival_idx < len(requests_by_release) or ready_queue or active_jobs:
+        # Admit arrivals at current cycle
+        while (
+            arrival_idx < len(requests_by_release)
+            and requests_by_release[arrival_idx].release_cycle <= current_cycle
+        ):
+            req = requests_by_release[arrival_idx]
+            arrival_idx += 1
+            specs = fold_specs_table.get(req.model)
+            if specs is None:
+                continue
+            ready_queue.append(ActiveJob(request=req, layer_specs=specs))
+
+        # Process layer completions
+        still_active: List[Tuple[int, ActiveJob]] = []
+        for finish_cycle, job in active_jobs:
+            if finish_cycle <= current_cycle:
+                free_arrays += job.n_arrays
+                job.current_layer_idx += 1
+                if job.current_layer_idx >= len(job.layer_specs):
+                    scheduled.append(
+                        ScheduledRequest(
+                            request=job.request,
+                            worker_id=job.n_arrays,
+                            start_cycle=job.job_start_cycle,
+                            finish_cycle=finish_cycle,
+                            slack_at_dispatch=(
+                                job.request.deadline_cycle
+                                - job.job_start_cycle
+                                - job.request.service_cycles
+                            ),
+                        )
+                    )
+                else:
+                    ready_queue.append(job)
+            else:
+                still_active.append((finish_cycle, job))
+        active_jobs = still_active
+
+        _dispatch()
+
+        # Advance to next event
+        pending: List[int] = []
+        if arrival_idx < len(requests_by_release):
+            pending.append(requests_by_release[arrival_idx].release_cycle)
+        for fc, _ in active_jobs:
+            pending.append(fc)
+        if pending:
+            current_cycle = min(pending)
         else:
             break
 
@@ -592,14 +781,39 @@ def main() -> int:
     service_table = ensure_service_table(args.service_csv, args.results_root, args.quiet)
     requests, duration_cycles = build_requests(scenario, service_table, args.hardware)
     num_workers = HARDWARE_CONFIGS[args.hardware]["num_workers"]
-    scheduled, _ = simulate_scheduler(requests, num_workers, args.policy)
+    cycles_per_second = int(scenario["cycles_per_second"])
+
+    hardware_cfg = HARDWARE_CONFIGS[args.hardware]
+    sa_size = SA_SIZE_FROM_LATENCY[hardware_cfg["latency_field"]]
+
+    # Load fold specs for layer-granularity scheduling
+    models_needed = set(r.model for r in requests)
+    fold_specs_table: Dict[str, List[LayerSpec]] = {}
+    for model in models_needed:
+        specs = load_fold_specs(args.results_root, model, sa_size)
+        if specs is not None:
+            fold_specs_table[model] = specs
+        elif not args.quiet:
+            print(f"INFO: fold specs missing for {model} sa{sa_size}, will fall back to model scheduler")
+
+    if fold_specs_table.keys() >= models_needed:
+        scheduled, _ = simulate_scheduler_layer(
+            requests, fold_specs_table, num_workers, args.policy, args.alloc
+        )
+        scheduler_mode = f"layer/{args.alloc}"
+    else:
+        scheduled, _ = simulate_scheduler(requests, num_workers, args.policy)
+        scheduler_mode = "model"
+
+    if not args.quiet:
+        print(f"INFO: scheduler_mode={scheduler_mode}")
+
     summary = summarize_run(scheduled, duration_cycles, num_workers)
 
     scenario_name = str(scenario.get("name", args.scenario.stem))
-    output_prefix = f"{scenario_name}_{args.hardware}_{args.policy}"
+    output_prefix = f"{scenario_name}_{args.hardware}_{args.policy}_{args.alloc}"
     trace_path = args.output_dir / f"{output_prefix}_trace.csv"
     summary_path = args.output_dir / f"{output_prefix}_summary.csv"
-    cycles_per_second = int(scenario["cycles_per_second"])
 
     write_trace_csv(scheduled, trace_path, cycles_per_second)
     write_summary_csv(summary, summary_path, scenario_name, args.policy, args.hardware, cycles_per_second)

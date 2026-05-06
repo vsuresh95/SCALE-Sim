@@ -54,6 +54,7 @@ class systolic_compute_os:
 
         self.mapping_efficiency_per_fold = []
         self.compute_utility_per_fold = []
+        self.cycles_per_fold = []
 
         # Flags
         self.params_set_flag = False
@@ -421,6 +422,7 @@ class systolic_compute_os:
 
                 self.mapping_efficiency_per_fold.append(mapping_eff_this_fold)
                 self.compute_utility_per_fold.append(compute_util_this_fold)
+                self.cycles_per_fold.append(cycles_this_fold)
 
                 # Add skew to the OFMAP demand matrix to reflect systolic pipeline fill
                 this_fold_demand = skew_matrix(this_fold_demand)
@@ -537,6 +539,23 @@ class systolic_compute_os:
         return avg_compute_util
 
     #
+    def get_fold_data(self):
+        """
+        Returns per-fold metrics as a list of tuples:
+        (fold_id, row_fold_idx, col_fold_idx, cycles, mapping_eff, compute_util)
+        Fold ordering matches the nested loop: outer col_fold, inner row_fold.
+        """
+        assert self.demand_mat_ready_flag, 'Computes not ready yet'
+        result = []
+        for fold_id, (cyc, meff, cutil) in enumerate(zip(
+                self.cycles_per_fold,
+                self.mapping_efficiency_per_fold,
+                self.compute_utility_per_fold)):
+            col_idx = fold_id // self.row_fold
+            row_idx = fold_id % self.row_fold
+            result.append((fold_id, row_idx, col_idx, cyc, meff, cutil))
+        return result
+
     def get_ifmap_requests(self):
         """
         Method to get ifmap read requests.

@@ -224,6 +224,10 @@ class simulator:
             header += '\n'
             sparse_report.write(header)
 
+        fold_report_name = self.top_path + '/FOLD_REPORT.csv'
+        fold_report = open(fold_report_name, 'w')
+        fold_report.write('LayerID, FoldID, RowFoldIdx, ColFoldIdx, Cycles, MappingEff, ComputeUtil,\n')
+
         for lid in range(len(self.single_layer_sim_object_list)):
             single_layer_obj = self.single_layer_sim_object_list[lid]
             compute_report_items_this_layer = single_layer_obj.get_compute_report_items()
@@ -274,7 +278,11 @@ class simulator:
                 log += ',\n'
                 sparse_report.write(log)
 
+            for fold_id, row_idx, col_idx, cyc, meff, cutil in single_layer_obj.get_fold_data():
+                fold_report.write(f'{lid}, {fold_id}, {row_idx}, {col_idx}, {cyc}, {meff:.6f}, {cutil:.6f},\n')
+
         compute_report.close()
+        fold_report.close()
         bandwidth_report.close()
         detail_report.close()
         time_report.close()

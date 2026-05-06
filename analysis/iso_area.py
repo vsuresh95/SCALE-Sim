@@ -73,9 +73,14 @@ def print_warning(message: str, quiet: bool) -> None:
         print(f"WARNING: {message}")
 
 
-def report_path(results_root: Path, model: str, sa_size: int) -> Path:
-    run_name = f"scale_{sa_size}x{sa_size}_ws"
+def report_path(results_root: Path, model: str, sa_size: int, dataflow: str = "os") -> Path:
+    run_name = f"scale_{sa_size}x{sa_size}_{dataflow}"
     return results_root / model / f"sa{sa_size}" / run_name / "COMPUTE_REPORT.csv"
+
+
+def fold_report_path(results_root: Path, model: str, sa_size: int, dataflow: str = "os") -> Path:
+    run_name = f"scale_{sa_size}x{sa_size}_{dataflow}"
+    return results_root / model / f"sa{sa_size}" / run_name / "FOLD_REPORT.csv"
 
 
 def load_compute_report(path: Path) -> ReportData:
@@ -98,20 +103,64 @@ def load_compute_report(path: Path) -> ReportData:
     return ReportData(total_cycles=total_cycles, overall_util_pct=overall_util_pct)
 
 
+@dataclass
+class FoldData:
+    """Per-layer fold counts and mean cycles, keyed by layer_id."""
+    fold_count: List[int]        # total folds per layer
+    fold_cycles_mean: List[float]  # mean cycles per fold per layer
+
+
+def load_fold_report(path: Path) -> FoldData:
+    """Load FOLD_REPORT.csv and return per-layer fold_count and mean fold cycles."""
+    layer_cycles: Dict[int, List[float]] = {}
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        reader.fieldnames = [f.strip() for f in reader.fieldnames]
+        for row in reader:
+            lid = int(row["LayerID"].strip())
+            cyc = float(row["Cycles"].strip())
+            layer_cycles.setdefault(lid, []).append(cyc)
+    fold_count = [len(v) for v in layer_cycles.values()]
+    fold_cycles_mean = [sum(v) / len(v) for v in layer_cycles.values()]
+    return FoldData(fold_count=fold_count, fold_cycles_mean=fold_cycles_mean)
+
+
 def maybe_load_reports(
     results_root: Path,
     model: str,
     sa_sizes: Iterable[int],
     quiet: bool = False,
+    dataflow: str = "os",
 ) -> Optional[Dict[int, ReportData]]:
     reports: Dict[int, ReportData] = {}
     for sa_size in sa_sizes:
-        path = report_path(results_root, model, sa_size)
+        path = report_path(results_root, model, sa_size, dataflow)
         if not path.exists():
             print_warning(f"missing compute report for {model} sa{sa_size}: {path}", quiet)
             return None
         try:
             reports[sa_size] = load_compute_report(path)
+        except (KeyError, ValueError) as exc:
+            print_warning(f"failed to parse {path}: {exc}", quiet)
+            return None
+    return reports
+
+
+def maybe_load_fold_reports(
+    results_root: Path,
+    model: str,
+    sa_sizes: Iterable[int],
+    quiet: bool = False,
+    dataflow: str = "os",
+) -> Optional[Dict[int, FoldData]]:
+    reports: Dict[int, FoldData] = {}
+    for sa_size in sa_sizes:
+        path = fold_report_path(results_root, model, sa_size, dataflow)
+        if not path.exists():
+            print_warning(f"missing fold report for {model} sa{sa_size}: {path}", quiet)
+            return None
+        try:
+            reports[sa_size] = load_fold_report(path)
         except (KeyError, ValueError) as exc:
             print_warning(f"failed to parse {path}: {exc}", quiet)
             return None

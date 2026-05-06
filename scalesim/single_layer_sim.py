@@ -405,6 +405,14 @@ class single_layer_sim:
         return items
 
     #
+    def get_fold_data(self):
+        """Returns per-fold metrics from the compute system for FOLD_REPORT.csv."""
+        return self.compute_system.get_fold_data()
+
+    def get_fold_counts(self):
+        """Returns (row_fold, col_fold) for this layer."""
+        return self.compute_system.row_fold, self.compute_system.col_fold
+
     def get_bandwidth_report_items(self):
         """
         Method to calculate data for the bandwidth report if not already done.
