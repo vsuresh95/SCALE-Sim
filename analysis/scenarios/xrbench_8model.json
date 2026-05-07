@@ -1,5 +1,5 @@
 {
-  "name": "xrbench_7model",
+  "name": "xrbench_8model",
   "duration_s": 10.0,
   "cycles_per_second": 100000000,
   "deadline_scale": 0.8,
@@ -32,6 +32,10 @@
     },
     "deit_small": {
       "fps": 10,
+      "task_priority": 1
+    },
+    "mobilellm_125m": {
+      "fps": 5,
       "task_priority": 1
     }
   }

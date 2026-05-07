@@ -45,7 +45,8 @@ class ScheduledRequest:
     worker_id: int
     start_cycle: int
     finish_cycle: int
-    slack_at_dispatch: int
+    slack_at_dispatch: int   # deadline - finish_cycle  (actual slack remaining)
+    array_cycles: int = 0    # Σ n_arrays × layer_duration across all layers
 
 
 @dataclass
@@ -62,6 +63,7 @@ class ActiveJob:
     job_start_cycle: int = 0
     layer_start_cycle: int = 0
     n_arrays: int = 0
+    array_cycles: int = 0    # running Σ n_arrays × layer_duration
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,7 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--service-csv",
         type=Path,
-        default=Path("analysis/iso_area_summary.csv"),
+        default=Path("outputs/scheduler_outputs/iso_area_summary.csv"),
         help="Stage 1 summary CSV to use as the service-time table.",
     )
     parser.add_argument(
@@ -317,6 +319,14 @@ def layer_time(spec: LayerSpec, n_arrays: int) -> float:
     return math.ceil(spec.fold_count / n_arrays) * spec.fold_cycles
 
 
+def remaining_cycles(job: "ActiveJob") -> float:
+    """Single-array execution time for all layers not yet started."""
+    return sum(
+        spec.fold_count * spec.fold_cycles
+        for spec in job.layer_specs[job.current_layer_idx:]
+    )
+
+
 def select_request(policy: str, waiting: List[Request], current_cycle: int) -> Request:
     if policy == "fifo":
         return min(waiting, key=lambda req: (req.release_cycle, req.request_id))
@@ -393,19 +403,26 @@ def simulate_scheduler(
 
 
 def select_active_job(policy: str, ready: List[ActiveJob], current_cycle: int) -> ActiveJob:
-    """Select next job from the layer-scheduler ready queue using the given policy."""
+    """Select next job from the layer-scheduler ready queue using the given policy.
+
+    Ordering criteria use remaining_cycles (sum of single-array layer times for
+    all unfinished layers) rather than the static whole-model service_cycles, so
+    priority correctly reflects how much work is left as layers complete.
+    """
     if policy == "fifo":
         return min(ready, key=lambda j: (j.request.release_cycle, j.request.request_id))
     if policy == "lpt":
-        return min(ready, key=lambda j: (-j.request.service_cycles, j.request.release_cycle, j.request.request_id))
+        # Longest remaining processing time first
+        return min(ready, key=lambda j: (-remaining_cycles(j), j.request.release_cycle, j.request.request_id))
     if policy == "deadline_task_aware":
+        # Smallest laxity first: time until deadline minus remaining execution
         return min(
             ready,
             key=lambda j: (
-                j.request.deadline_cycle - current_cycle - j.request.service_cycles,
+                j.request.deadline_cycle - current_cycle - remaining_cycles(j),
                 j.request.deadline_cycle,
                 -j.request.task_priority,
-                -j.request.service_cycles,
+                -remaining_cycles(j),
                 j.request.release_cycle,
                 j.request.request_id,
             ),
@@ -439,8 +456,9 @@ def simulate_scheduler_layer(
             job.job_start_cycle = current_cycle
         job.layer_start_cycle = current_cycle
         job.n_arrays = n
-        finish = current_cycle + int(math.ceil(layer_time(spec, n)))
-        active_jobs.append((finish, job))
+        duration = int(math.ceil(layer_time(spec, n)))
+        job.array_cycles += n * duration
+        active_jobs.append((current_cycle + duration, job))
 
     def _dispatch() -> None:
         if not ready_queue or free_arrays == 0:
@@ -496,11 +514,8 @@ def simulate_scheduler_layer(
                             worker_id=job.n_arrays,
                             start_cycle=job.job_start_cycle,
                             finish_cycle=finish_cycle,
-                            slack_at_dispatch=(
-                                job.request.deadline_cycle
-                                - job.job_start_cycle
-                                - job.request.service_cycles
-                            ),
+                            slack_at_dispatch=job.request.deadline_cycle - finish_cycle,
+                            array_cycles=job.array_cycles,
                         )
                     )
                 else:
@@ -550,7 +565,12 @@ def summarize_run(
     response_cycles = [item.finish_cycle - item.request.release_cycle for item in scheduled]
     wait_cycles = [item.start_cycle - item.request.release_cycle for item in scheduled]
     deadline_misses = sum(1 for item in scheduled if item.finish_cycle > item.request.deadline_cycle)
-    total_busy_cycles = sum(item.request.service_cycles for item in scheduled)
+    # Use actual array-cycles consumed if tracked (layer scheduler), else fall back to
+    # service_cycles × 1 array (model scheduler).
+    total_busy_cycles = sum(
+        item.array_cycles if item.array_cycles > 0 else item.request.service_cycles
+        for item in scheduled
+    )
     last_finish = max((item.finish_cycle for item in scheduled), default=0)
     horizon_cycles = max(duration_cycles, last_finish)
 
@@ -596,6 +616,7 @@ def write_trace_csv(
         "wait_cycles",
         "response_cycles",
         "slack_at_dispatch_cycles",
+        "array_cycles",
         "deadline_miss",
         "release_s",
         "start_s",
@@ -627,6 +648,7 @@ def write_trace_csv(
                     "wait_cycles": wait_cycles,
                     "response_cycles": response_cycles,
                     "slack_at_dispatch_cycles": item.slack_at_dispatch,
+                    "array_cycles": item.array_cycles,
                     "deadline_miss": deadline_miss,
                     "release_s": f"{cycles_to_seconds(item.request.release_cycle, cycles_per_second):.9f}",
                     "start_s": f"{cycles_to_seconds(item.start_cycle, cycles_per_second):.9f}",

@@ -11,7 +11,7 @@ from statistics import mean
 from typing import Dict, Iterable, List, Optional
 
 
-DEFAULT_MODELS = ["hand_pose", "eyecod", "key_res15", "tcn", "d2go", "emformer", "deit_small"]
+DEFAULT_MODELS = ["hand_pose", "eyecod", "key_res15", "tcn", "d2go", "emformer", "deit_small", "mobilellm_125m"]
 DEFAULT_SA_SIZES = [16, 32, 64, 128]
 
 
