@@ -33,14 +33,14 @@
     "emformer": {
       "mode": "throughput",
       "task_priority": 0,
-      "mean_burst_interval_s": 2.0,
+      "mean_burst_interval_s": 1.0,
       "mean_burst_size": 20
     },
     "mobilellm_125m": {
       "mode": "throughput",
       "task_priority": 0,
       "mean_burst_interval_s": 3.0,
-      "mean_burst_size": 200
+      "mean_burst_size": 50
     }
   }
 }

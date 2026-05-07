@@ -29,7 +29,7 @@ SA_SIZE_FROM_LATENCY = {"lat_128": 128, "lat_64": 64, "lat_32": 32, "lat_16": 16
 # Sentinel deadline for throughput-mode tasks: effectively no deadline.
 # Value is large enough that finish_cycle never exceeds it, but small enough
 # to avoid any overflow issues in arithmetic comparisons.
-THROUGHPUT_NO_DEADLINE = 10**15
+THROUGHPUT_NO_DEADLINE = 10**12
 
 
 @dataclass
@@ -53,14 +53,16 @@ class ScheduledRequest:
     start_cycle: int
     finish_cycle: int
     slack_at_dispatch: int   # deadline - finish_cycle  (actual slack remaining)
-    array_cycles: int = 0    # Σ n_arrays × layer_duration across all layers
+    array_cycles: int = 0     # Σ n_arrays × layer_duration across all layers
+    pe_array_cycles: int = 0  # Σ n_arrays × layer_duration × mean_pe_eff across all layers
     dropped: bool = False    # True if evicted mid-inference once deadline is unachievable
 
 
 @dataclass
 class LayerSpec:
     fold_count: int
-    fold_cycles: float  # mean cycles per fold
+    fold_cycles: float   # mean cycles per fold
+    mean_pe_eff: float = 1.0  # mean(MappingEff × ComputeUtil) across folds
 
 
 @dataclass
@@ -71,7 +73,8 @@ class ActiveJob:
     job_start_cycle: int = 0
     layer_start_cycle: int = 0
     n_arrays: int = 0
-    array_cycles: int = 0    # running Σ n_arrays × layer_duration
+    array_cycles: int = 0     # running Σ n_arrays × layer_duration
+    pe_array_cycles: int = 0  # running Σ n_arrays × layer_duration × mean_pe_eff
     _rem_cycles: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -338,6 +341,7 @@ def load_fold_specs(results_root: Path, model: str, sa_size: int) -> Optional[Li
     if not path.exists():
         return None
     layer_data: Dict[int, List[float]] = {}
+    layer_pe_eff: Dict[int, List[float]] = {}
     try:
         with path.open(newline="") as handle:
             reader = csv.DictReader(handle)
@@ -346,6 +350,12 @@ def load_fold_specs(results_root: Path, model: str, sa_size: int) -> Optional[Li
                 lid = int(row["LayerID"].strip())
                 cyc = float(row["Cycles"].strip())
                 layer_data.setdefault(lid, []).append(cyc)
+                try:
+                    map_eff = float(row["MappingEff"].strip())
+                    cmp_util = float(row["ComputeUtil"].strip())
+                    layer_pe_eff.setdefault(lid, []).append(map_eff * cmp_util)
+                except (KeyError, ValueError):
+                    layer_pe_eff.setdefault(lid, []).append(1.0)
     except (KeyError, ValueError):
         return None
     if not layer_data:
@@ -353,7 +363,12 @@ def load_fold_specs(results_root: Path, model: str, sa_size: int) -> Optional[Li
     specs = []
     for lid in sorted(layer_data.keys()):
         folds = layer_data[lid]
-        specs.append(LayerSpec(fold_count=len(folds), fold_cycles=sum(folds) / len(folds)))
+        pe_effs = layer_pe_eff.get(lid, [1.0])
+        specs.append(LayerSpec(
+            fold_count=len(folds),
+            fold_cycles=sum(folds) / len(folds),
+            mean_pe_eff=sum(pe_effs) / len(pe_effs),
+        ))
     return specs
 
 
@@ -553,6 +568,7 @@ def simulate_scheduler_layer(
         job.n_arrays = n
         duration = int(math.ceil(layer_time(spec, n)))
         job.array_cycles += n * duration
+        job.pe_array_cycles += int(n * duration * spec.mean_pe_eff)
         active_jobs.append((current_cycle + duration, job))
 
     def _dispatch() -> None:
@@ -689,6 +705,7 @@ def simulate_scheduler_layer(
                             finish_cycle=finish_cycle,
                             slack_at_dispatch=job.request.deadline_cycle - finish_cycle,
                             array_cycles=job.array_cycles,
+                            pe_array_cycles=job.pe_array_cycles,
                         )
                     )
                     # Chain the next autoregressive step if the burst is not done.
@@ -725,6 +742,7 @@ def simulate_scheduler_layer(
                                 finish_cycle=current_cycle,
                                 slack_at_dispatch=time_left,
                                 array_cycles=job.array_cycles,
+                                pe_array_cycles=job.pe_array_cycles,
                                 dropped=True,
                             )
                         )
@@ -786,6 +804,10 @@ def summarize_run(
         item.array_cycles if item.array_cycles > 0 else item.request.service_cycles
         for item in scheduled
     )
+    total_pe_busy_cycles = sum(
+        item.pe_array_cycles if item.pe_array_cycles > 0 else item.request.service_cycles
+        for item in scheduled
+    )
     last_finish = max((item.finish_cycle for item in scheduled), default=0)
     horizon_cycles = max(duration_cycles, last_finish)
 
@@ -805,6 +827,9 @@ def summarize_run(
         "p95_wait_cycles": percentile(wait_cycles_sorted, 0.95),
         "worker_utilization": (
             total_busy_cycles / float(num_workers * horizon_cycles) if horizon_cycles > 0 else 0.0
+        ),
+        "pe_utilization": (
+            total_pe_busy_cycles / float(num_workers * horizon_cycles) if horizon_cycles > 0 else 0.0
         ),
         "last_finish_cycle": last_finish,
         "horizon_cycles": horizon_cycles,
@@ -903,6 +928,7 @@ def write_summary_csv(
         "mean_wait_cycles",
         "p95_wait_cycles",
         "worker_utilization",
+        "pe_utilization",
         "last_finish_cycle",
         "horizon_cycles",
     ]
@@ -935,10 +961,10 @@ def write_model_logs(
     # Index simulation results by request_id for O(1) lookup
     result_by_id: Dict[int, ScheduledRequest] = {item.request.request_id: item for item in scheduled}
 
-    # Group requests by model
+    # Group all executed requests by model (includes chained burst steps not in seed list)
     models: Dict[str, List[Request]] = {}
-    for req in requests:
-        models.setdefault(req.model, []).append(req)
+    for item in scheduled:
+        models.setdefault(item.request.model, []).append(item.request)
 
     def _cy(cycles: int) -> str:
         return f"{cycles_to_seconds(cycles, cycles_per_second)*1000:.3f}ms"
@@ -978,21 +1004,24 @@ def write_model_logs(
             cy_w = max(14, len(_cy(max_finish)))
             hdr = (f"{'req_id':>7}  {'release':>{cy_w}}  {'deadline':>{cy_w}}  "
                    f"{'worker':>6}  {'start':>{cy_w}}  {'finish':>{cy_w}}  "
-                   f"{'wait':>{cy_w}}  {'slack@dispatch(ms)':>19}  {'miss':>4}\n")
+                   f"{'exec_time':>{cy_w}}  {'wait':>{cy_w}}  {'slack@dispatch(ms)':>19}  {'miss':>4}\n")
             f.write(hdr)
             f.write("-" * len(hdr.rstrip()) + "\n")
 
             for req in sorted(reqs, key=lambda r: r.release_cycle):
                 item = result_by_id[req.request_id]
                 wait = item.start_cycle - req.release_cycle
+                exec_time = item.finish_cycle - item.start_cycle
                 miss = item.dropped or item.finish_cycle > req.deadline_cycle
+                finish_str = (_cy(item.finish_cycle) + "(D)") if item.dropped else _cy(item.finish_cycle)
                 f.write(
                     f"{req.request_id:>7}  "
                     f"{_cy(req.release_cycle):>{cy_w}}  "
                     f"{_cy(req.deadline_cycle):>{cy_w}}  "
                     f"{item.worker_id:>6}  "
                     f"{_cy(item.start_cycle):>{cy_w}}  "
-                    f"{_cy(item.finish_cycle):>{cy_w}}  "
+                    f"{finish_str:>{cy_w + 3}}  "
+                    f"{_cy(exec_time):>{cy_w}}  "
                     f"{_cy(wait):>{cy_w}}  "
                     f"{cycles_to_seconds(item.slack_at_dispatch, cycles_per_second)*1000:>+16.3f}ms  "
                     f"{'MISS' if miss else 'ok':>4}\n"
