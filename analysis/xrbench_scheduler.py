@@ -773,11 +773,13 @@ def summarize_run(
     num_workers: int,
 ) -> Dict[str, float]:
     completed = [item for item in scheduled if not item.dropped]
-    dropped_items = [item for item in scheduled if item.dropped]
 
     response_cycles = [item.finish_cycle - item.request.release_cycle for item in completed]
     wait_cycles = [item.start_cycle - item.request.release_cycle for item in completed]
-    deadline_misses = sum(1 for item in completed if item.finish_cycle > item.request.deadline_cycle)
+    deadline_misses = sum(
+        1 for item in scheduled
+        if item.dropped or item.finish_cycle > item.request.deadline_cycle
+    )
     # Use actual array-cycles consumed if tracked (layer scheduler), else fall back to
     # service_cycles × 1 array (model scheduler).
     total_busy_cycles = sum(
@@ -794,10 +796,8 @@ def summarize_run(
     summary = {
         "arrivals": n_total,
         "completions": n_completed,
-        "drops": len(dropped_items),
         "deadline_misses": deadline_misses,
-        "miss_rate": (deadline_misses / n_completed) if n_completed else 0.0,
-        "drop_rate": (len(dropped_items) / n_total) if n_total else 0.0,
+        "miss_rate": (deadline_misses / n_total) if n_total else 0.0,
         "mean_response_cycles": (sum(response_cycles) / len(response_cycles)) if response_cycles else 0.0,
         "p95_response_cycles": percentile(response_cycles_sorted, 0.95),
         "max_response_cycles": max(response_cycles, default=0),
@@ -835,7 +835,6 @@ def write_trace_csv(
         "slack_at_dispatch_cycles",
         "array_cycles",
         "deadline_miss",
-        "dropped",
         "mode",
         "release_s",
         "start_s",
@@ -850,7 +849,7 @@ def write_trace_csv(
         for item in scheduled:
             wait_cycles = item.start_cycle - item.request.release_cycle
             response_cycles = item.finish_cycle - item.request.release_cycle
-            deadline_miss = int(item.finish_cycle > item.request.deadline_cycle)
+            deadline_miss = int(item.finish_cycle > item.request.deadline_cycle or item.dropped)
             writer.writerow(
                 {
                     "request_id": item.request.request_id,
@@ -869,7 +868,6 @@ def write_trace_csv(
                     "slack_at_dispatch_cycles": item.slack_at_dispatch,
                     "array_cycles": item.array_cycles,
                     "deadline_miss": deadline_miss,
-                    "dropped": int(item.dropped),
                     "mode": item.request.mode,
                     "release_s": f"{cycles_to_seconds(item.request.release_cycle, cycles_per_second):.9f}",
                     "start_s": f"{cycles_to_seconds(item.start_cycle, cycles_per_second):.9f}",
@@ -897,10 +895,8 @@ def write_summary_csv(
         "cycles_per_second",
         "arrivals",
         "completions",
-        "drops",
         "deadline_misses",
         "miss_rate",
-        "drop_rate",
         "mean_response_cycles",
         "p95_response_cycles",
         "max_response_cycles",
@@ -949,9 +945,13 @@ def write_model_logs(
 
     for model, reqs in sorted(models.items()):
         log_path = output_dir / f"{output_prefix}_{model}_log.txt"
-        drops = sum(1 for r in reqs if result_by_id[r.request_id].dropped)
-        completed_reqs = [r for r in reqs if not result_by_id[r.request_id].dropped]
-        misses = sum(1 for r in completed_reqs if result_by_id[r.request_id].finish_cycle > r.deadline_cycle)
+        violations = sum(
+            1 for r in reqs
+            if result_by_id[r.request_id].dropped
+            or result_by_id[r.request_id].finish_cycle > r.deadline_cycle
+        )
+        hit_reqs = [r for r in reqs if not result_by_id[r.request_id].dropped
+                    and result_by_id[r.request_id].finish_cycle <= r.deadline_cycle]
 
         with log_path.open("w") as f:
             # Header
@@ -962,9 +962,7 @@ def write_model_logs(
             f.write(f"  POLICY       : {policy}\n")
             f.write(f"  CLOCK        : {cycles_per_second/1e6:.0f} MHz\n")
             f.write(f"  TOTAL REQS   : {len(reqs)}\n")
-            f.write(f"  DROPPED      : {drops} / {len(reqs)} ({drops/len(reqs)*100:.1f}%)\n")
-            miss_pct = (misses / len(completed_reqs) * 100) if completed_reqs else float("nan")
-            f.write(f"  DEADLINE MISS: {misses} / {len(completed_reqs)} ({miss_pct:.1f}% of completed)\n")
+            f.write(f"  DEADLINE MISS: {violations} / {len(reqs)} ({violations/len(reqs)*100:.1f}%)\n")
             first = reqs[0]
             f.write(f"  MODE         : {first.mode}\n")
             f.write(f"  SERVICE TIME : {_cy(first.service_cycles)}\n")
@@ -987,7 +985,7 @@ def write_model_logs(
             for req in sorted(reqs, key=lambda r: r.release_cycle):
                 item = result_by_id[req.request_id]
                 wait = item.start_cycle - req.release_cycle
-                miss = item.finish_cycle > req.deadline_cycle
+                miss = item.dropped or item.finish_cycle > req.deadline_cycle
                 f.write(
                     f"{req.request_id:>7}  "
                     f"{_cy(req.release_cycle):>{cy_w}}  "
@@ -1000,21 +998,21 @@ def write_model_logs(
                     f"{'MISS' if miss else 'ok':>4}\n"
                 )
 
-            # Per-model summary stats (completed requests only)
-            waits = [result_by_id[r.request_id].start_cycle - r.release_cycle for r in completed_reqs]
-            responses = [result_by_id[r.request_id].finish_cycle - r.release_cycle for r in completed_reqs]
+            # Per-model summary stats (on-time completions only)
+            waits = [result_by_id[r.request_id].start_cycle - r.release_cycle for r in hit_reqs]
+            responses = [result_by_id[r.request_id].finish_cycle - r.release_cycle for r in hit_reqs]
             f.write("\n--- MODEL SUMMARY ---\n")
             if waits:
                 f.write(f"  mean wait    : {_cy(int(sum(waits)/len(waits)))}\n")
                 f.write(f"  max wait     : {_cy(max(waits))}\n")
             else:
-                f.write(f"  mean wait    : n/a (all dropped)\n")
+                f.write(f"  mean wait    : n/a (all missed)\n")
                 f.write(f"  max wait     : n/a\n")
             if responses:
                 f.write(f"  mean response: {_cy(int(sum(responses)/len(responses)))}\n")
                 f.write(f"  max response : {_cy(max(responses))}\n")
             else:
-                f.write(f"  mean response: n/a (all dropped)\n")
+                f.write(f"  mean response: n/a (all missed)\n")
                 f.write(f"  max response : n/a\n")
 
 

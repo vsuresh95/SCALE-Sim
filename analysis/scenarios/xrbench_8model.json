@@ -2,16 +2,16 @@
   "name": "xrbench_8model",
   "duration_s": 10.0,
   "cycles_per_second": 100000000,
-  "deadline_scale": 0.8,
-  "jitter_fraction": 0.2,
+  "deadline_scale": 0.5,
+  "jitter_fraction": 0.3,
   "random_seed": 0,
   "tasks": {
     "eyecod": {
-      "fps": 60,
+      "fps": 120,
       "task_priority": 1
     },
     "hand_pose": {
-      "fps": 30,
+      "fps": 60,
       "task_priority": 1
     },
     "key_res15": {
@@ -27,7 +27,7 @@
       "task_priority": 1
     },
     "deit_small": {
-      "fps": 10,
+      "fps": 30,
       "task_priority": 1
     },
     "emformer": {
@@ -40,7 +40,7 @@
       "mode": "throughput",
       "task_priority": 0,
       "mean_burst_interval_s": 3.0,
-      "mean_burst_size": 50
+      "mean_burst_size": 200
     }
   }
 }
