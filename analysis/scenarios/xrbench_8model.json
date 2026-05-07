@@ -26,17 +26,21 @@
       "fps": 30,
       "task_priority": 1
     },
-    "emformer": {
-      "fps": 10,
-      "task_priority": 1
-    },
     "deit_small": {
       "fps": 10,
       "task_priority": 1
     },
+    "emformer": {
+      "mode": "throughput",
+      "task_priority": 0,
+      "mean_burst_interval_s": 2.0,
+      "mean_burst_size": 20
+    },
     "mobilellm_125m": {
-      "fps": 5,
-      "task_priority": 1
+      "mode": "throughput",
+      "task_priority": 0,
+      "mean_burst_interval_s": 3.0,
+      "mean_burst_size": 50
     }
   }
 }

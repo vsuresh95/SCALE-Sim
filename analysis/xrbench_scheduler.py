@@ -8,7 +8,7 @@ import csv
 import json
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -23,8 +23,13 @@ HARDWARE_CONFIGS = {
 }
 
 SUPPORTED_POLICIES = {"fifo", "lpt", "deadline_task_aware"}
-SUPPORTED_ALLOC = {"greedy", "fair"}
+SUPPORTED_ALLOC = {"greedy", "fair", "deadline_fold"}
 SA_SIZE_FROM_LATENCY = {"lat_128": 128, "lat_64": 64, "lat_32": 32, "lat_16": 16}
+
+# Sentinel deadline for throughput-mode tasks: effectively no deadline.
+# Value is large enough that finish_cycle never exceeds it, but small enough
+# to avoid any overflow issues in arithmetic comparisons.
+THROUGHPUT_NO_DEADLINE = 10**15
 
 
 @dataclass
@@ -37,6 +42,8 @@ class Request:
     task_priority: int
     fps: float
     deadline_scale: float
+    mode: str = "latency"   # "latency" | "throughput"
+    burst_remaining: int = 0  # requests left to chain after this one (autoregressive)
 
 
 @dataclass
@@ -47,6 +54,7 @@ class ScheduledRequest:
     finish_cycle: int
     slack_at_dispatch: int   # deadline - finish_cycle  (actual slack remaining)
     array_cycles: int = 0    # Σ n_arrays × layer_duration across all layers
+    dropped: bool = False    # True if evicted mid-inference once deadline is unachievable
 
 
 @dataclass
@@ -64,6 +72,10 @@ class ActiveJob:
     layer_start_cycle: int = 0
     n_arrays: int = 0
     array_cycles: int = 0    # running Σ n_arrays × layer_duration
+    _rem_cycles: float = field(default=0.0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._rem_cycles = sum(s.fold_count * s.fold_cycles for s in self.layer_specs)
 
 
 def parse_args() -> argparse.Namespace:
@@ -223,15 +235,45 @@ def build_requests(
     for model, task_cfg in tasks.items():
         if model not in service_table:
             raise KeyError(f"model {model} missing from service table")
-        fps = float(task_cfg["fps"])
+        mode = task_cfg.get("mode", "latency")
+        priority = int(task_cfg.get("task_priority", 1))
+        service_cycles = int(round(service_table[model][latency_field]))
+
+        if mode == "throughput":
+            # Bursts arrive as a Poisson process; size is geometrically distributed.
+            # Within each burst requests are autoregressive: the scheduler re-injects
+            # the next step only after the previous one finishes (burst_remaining > 0).
+            mean_burst_interval_s = float(task_cfg.get("mean_burst_interval_s", 5.0))
+            mean_burst_size = int(task_cfg.get("mean_burst_size", 30))
+            t = rng.expovariate(1.0 / mean_burst_interval_s)
+            while t < duration_s:
+                arrival_cycle = seconds_to_cycles(t, cycles_per_second)
+                burst_size = max(1, int(rng.expovariate(1.0 / mean_burst_size)))
+                requests.append(
+                    Request(
+                        request_id=request_id,
+                        model=model,
+                        release_cycle=arrival_cycle,
+                        deadline_cycle=THROUGHPUT_NO_DEADLINE,
+                        service_cycles=service_cycles,
+                        task_priority=priority,
+                        fps=0.0,
+                        deadline_scale=0.0,
+                        mode="throughput",
+                        burst_remaining=burst_size - 1,
+                    )
+                )
+                request_id += 1
+                t += rng.expovariate(1.0 / mean_burst_interval_s)
+            continue
+
+        fps = float(task_cfg.get("fps", 0))
         if fps <= 0:
             continue
-        priority = int(task_cfg.get("task_priority", 1))
         period_s = 1.0 / fps
         period_cycles = seconds_to_cycles(period_s, cycles_per_second)
         deadline_scale = float(task_cfg.get("deadline_scale", default_deadline_scale))
         deadline_cycles = max(1, seconds_to_cycles(period_s * deadline_scale, cycles_per_second))
-        service_cycles = int(round(service_table[model][latency_field]))
         arrivals = generate_arrival_cycles(
             duration_s=duration_s,
             period_s=period_s,
@@ -251,6 +293,7 @@ def build_requests(
                     task_priority=priority,
                     fps=fps,
                     deadline_scale=deadline_scale,
+                    mode="latency",
                 )
             )
             request_id += 1
@@ -320,22 +363,37 @@ def layer_time(spec: LayerSpec, n_arrays: int) -> float:
 
 
 def remaining_cycles(job: "ActiveJob") -> float:
-    """Single-array execution time for all layers not yet started."""
+    """Single-array execution time for all layers not yet started (O(1) cached)."""
+    return job._rem_cycles
+
+
+def min_remaining_cycles(job: "ActiveJob", max_arrays: int) -> float:
+    """Optimistic lower bound on remaining cycles assuming max_arrays arrays are available.
+
+    Each layer is parallelised up to min(max_arrays, fold_count) arrays, so this gives
+    the fastest the job could possibly finish from the current layer onward.  If this
+    value exceeds (deadline - now), the deadline is surely unachievable.
+    """
     return sum(
-        spec.fold_count * spec.fold_cycles
+        math.ceil(spec.fold_count / min(max_arrays, spec.fold_count)) * spec.fold_cycles
         for spec in job.layer_specs[job.current_layer_idx:]
     )
 
 
+def _is_tp(req: Request) -> int:
+    return 0 if req.mode == "latency" else 1
+
+
 def select_request(policy: str, waiting: List[Request], current_cycle: int) -> Request:
     if policy == "fifo":
-        return min(waiting, key=lambda req: (req.release_cycle, req.request_id))
+        return min(waiting, key=lambda req: (_is_tp(req), req.release_cycle, req.request_id))
     if policy == "lpt":
-        return min(waiting, key=lambda req: (-req.service_cycles, req.release_cycle, req.request_id))
+        return min(waiting, key=lambda req: (_is_tp(req), -req.service_cycles, req.release_cycle, req.request_id))
     if policy == "deadline_task_aware":
         return min(
             waiting,
             key=lambda req: (
+                _is_tp(req),
                 req.deadline_cycle - current_cycle - req.service_cycles,
                 req.deadline_cycle,
                 -req.task_priority,
@@ -351,6 +409,7 @@ def simulate_scheduler(
     requests: List[Request],
     num_workers: int,
     policy: str,
+    duration_cycles: int = 0,
 ) -> Tuple[List[ScheduledRequest], int]:
     requests_by_release = list(requests)
     waiting: List[Request] = []
@@ -358,6 +417,7 @@ def simulate_scheduler(
     worker_available = [0 for _ in range(num_workers)]
     current_cycle = 0
     arrival_idx = 0
+    next_req_id = (max(r.request_id for r in requests) + 1) if requests else 0
 
     while arrival_idx < len(requests_by_release) or waiting or any(
         available > current_cycle for available in worker_available
@@ -384,6 +444,35 @@ def simulate_scheduler(
                     slack_at_dispatch=slack_at_dispatch,
                 )
             )
+            # Chain next autoregressive step if burst is not exhausted.
+            if (request.mode == "throughput"
+                    and request.burst_remaining > 0
+                    and duration_cycles > 0
+                    and finish_cycle < duration_cycles):
+                new_req = Request(
+                    request_id=next_req_id,
+                    model=request.model,
+                    release_cycle=finish_cycle,
+                    deadline_cycle=THROUGHPUT_NO_DEADLINE,
+                    service_cycles=request.service_cycles,
+                    task_priority=request.task_priority,
+                    fps=0.0,
+                    deadline_scale=0.0,
+                    mode="throughput",
+                    burst_remaining=request.burst_remaining - 1,
+                )
+                next_req_id += 1
+                # Insert in sorted order; re-injection is always >= current_cycle
+                # so the insertion point is always at or after arrival_idx.
+                lo, hi = arrival_idx, len(requests_by_release)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    r = requests_by_release[mid]
+                    if (r.release_cycle, r.request_id) < (new_req.release_cycle, new_req.request_id):
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                requests_by_release.insert(lo, new_req)
 
         pending_times = []
         if arrival_idx < len(requests_by_release):
@@ -402,23 +491,27 @@ def simulate_scheduler(
     return scheduled, final_cycle
 
 
+def _is_tp_job(job: "ActiveJob") -> int:
+    return 0 if job.request.mode == "latency" else 1
+
+
 def select_active_job(policy: str, ready: List[ActiveJob], current_cycle: int) -> ActiveJob:
     """Select next job from the layer-scheduler ready queue using the given policy.
 
-    Ordering criteria use remaining_cycles (sum of single-array layer times for
-    all unfinished layers) rather than the static whole-model service_cycles, so
-    priority correctly reflects how much work is left as layers complete.
+    Latency-mode jobs always take priority over throughput-mode jobs.
+    Within each class, ordering criteria use remaining_cycles (sum of
+    single-array layer times for all unfinished layers) so priority
+    correctly reflects how much work is left as layers complete.
     """
     if policy == "fifo":
-        return min(ready, key=lambda j: (j.request.release_cycle, j.request.request_id))
+        return min(ready, key=lambda j: (_is_tp_job(j), j.request.release_cycle, j.request.request_id))
     if policy == "lpt":
-        # Longest remaining processing time first
-        return min(ready, key=lambda j: (-remaining_cycles(j), j.request.release_cycle, j.request.request_id))
+        return min(ready, key=lambda j: (_is_tp_job(j), -remaining_cycles(j), j.request.release_cycle, j.request.request_id))
     if policy == "deadline_task_aware":
-        # Smallest laxity first: time until deadline minus remaining execution
         return min(
             ready,
             key=lambda j: (
+                _is_tp_job(j),
                 j.request.deadline_cycle - current_cycle - remaining_cycles(j),
                 j.request.deadline_cycle,
                 -j.request.task_priority,
@@ -436,10 +529,12 @@ def simulate_scheduler_layer(
     num_workers: int,
     policy: str,
     alloc: str,
+    duration_cycles: int = 0,
 ) -> Tuple[List[ScheduledRequest], int]:
     """Layer-granularity scheduler: allocate arrays dynamically at each layer boundary."""
     requests_by_release = sorted(requests, key=lambda r: (r.release_cycle, r.request_id))
     arrival_idx = 0
+    next_req_id = (max(r.request_id for r in requests) + 1) if requests else 0
 
     free_arrays = num_workers
     ready_queue: List[ActiveJob] = []
@@ -471,7 +566,7 @@ def simulate_scheduler_layer(
                 ready_queue.remove(job)
                 n = free_arrays  # give all remaining (capped inside _start_layer)
                 _start_layer(job, n)
-        else:  # fair
+        elif alloc == "fair":
             n_dispatch = min(len(ready_queue), free_arrays)
             if n_dispatch == 0:
                 return
@@ -486,6 +581,81 @@ def simulate_scheduler_layer(
             for i, job in enumerate(jobs_to_start):
                 ready_queue.remove(job)
                 n = base + (1 if i < extra else 0)
+                _start_layer(job, n)
+        else:  # deadline_fold
+            n_dispatch = min(len(ready_queue), free_arrays)
+            if n_dispatch == 0:
+                return
+            tmp = list(ready_queue)
+            jobs_to_start = []
+            for _ in range(n_dispatch):
+                job = select_active_job(policy, tmp, current_cycle)
+                tmp.remove(job)
+                jobs_to_start.append(job)
+
+            # Per-job urgency (inverse slack) and per-layer fold cap.
+            # Throughput jobs get near-zero urgency so latency jobs absorb
+            # arrays first; leftover goes to throughput.
+            job_urgency = []
+            job_fold_cap = []
+            for job in jobs_to_start:
+                spec = job.layer_specs[job.current_layer_idx]
+                job_fold_cap.append(spec.fold_count)
+                if job.request.mode == "throughput":
+                    job_urgency.append(0.0)
+                else:
+                    slack = job.request.deadline_cycle - current_cycle - remaining_cycles(job)
+                    job_urgency.append(1.0 / max(float(slack), 1.0))
+
+            # Guarantee 1 array to every selected job; distribute the rest
+            # proportionally to urgency, capped at each job's fold_count.
+            alloc_n = [1] * len(jobs_to_start)
+            budget = free_arrays - len(jobs_to_start)
+
+            # Only jobs whose fold_count > 1 can absorb extra arrays.
+            active = [i for i in range(len(jobs_to_start)) if job_fold_cap[i] > 1]
+            while budget > 0 and active:
+                total_urg = sum(job_urgency[i] for i in active)
+                if total_urg == 0.0:
+                    # All throughput (or zero-urgency): distribute uniformly.
+                    per = budget // len(active)
+                    for i in active:
+                        alloc_n[i] += min(per, job_fold_cap[i] - alloc_n[i])
+                    break
+
+                # Find jobs whose proportional share hits the fold cap;
+                # absorb those, then redistribute surplus in the next pass.
+                newly_capped = []
+                cap_absorbed = 0
+                for i in active:
+                    share = budget * job_urgency[i] / total_urg
+                    max_extra = job_fold_cap[i] - alloc_n[i]
+                    if share >= max_extra:
+                        alloc_n[i] = job_fold_cap[i]
+                        cap_absorbed += max_extra
+                        newly_capped.append(i)
+
+                if newly_capped:
+                    budget -= cap_absorbed
+                    active = [i for i in active if i not in newly_capped]
+                else:
+                    # No caps hit: floor-allocate, give remainder to highest urgency.
+                    distributed = 0
+                    for i in active:
+                        extra = int(budget * job_urgency[i] / total_urg)
+                        alloc_n[i] += extra
+                        distributed += extra
+                    budget -= distributed
+                    for i in sorted(active, key=lambda x: -job_urgency[x]):
+                        if budget <= 0:
+                            break
+                        if alloc_n[i] < job_fold_cap[i]:
+                            alloc_n[i] += 1
+                            budget -= 1
+                    break
+
+            for job, n in zip(jobs_to_start, alloc_n):
+                ready_queue.remove(job)
                 _start_layer(job, n)
 
     while arrival_idx < len(requests_by_release) or ready_queue or active_jobs:
@@ -506,6 +676,9 @@ def simulate_scheduler_layer(
         for finish_cycle, job in active_jobs:
             if finish_cycle <= current_cycle:
                 free_arrays += job.n_arrays
+                # Update cached remaining cycles before advancing the layer index
+                completed_spec = job.layer_specs[job.current_layer_idx]
+                job._rem_cycles -= completed_spec.fold_count * completed_spec.fold_cycles
                 job.current_layer_idx += 1
                 if job.current_layer_idx >= len(job.layer_specs):
                     scheduled.append(
@@ -518,8 +691,45 @@ def simulate_scheduler_layer(
                             array_cycles=job.array_cycles,
                         )
                     )
+                    # Chain the next autoregressive step if the burst is not done.
+                    if (job.request.mode == "throughput"
+                            and job.request.burst_remaining > 0
+                            and duration_cycles > 0
+                            and finish_cycle < duration_cycles):
+                        specs = fold_specs_table.get(job.request.model)
+                        if specs is not None:
+                            new_req = Request(
+                                request_id=next_req_id,
+                                model=job.request.model,
+                                release_cycle=finish_cycle,
+                                deadline_cycle=THROUGHPUT_NO_DEADLINE,
+                                service_cycles=job.request.service_cycles,
+                                task_priority=job.request.task_priority,
+                                fps=0.0,
+                                deadline_scale=0.0,
+                                mode="throughput",
+                                burst_remaining=job.request.burst_remaining - 1,
+                            )
+                            next_req_id += 1
+                            ready_queue.append(ActiveJob(request=new_req, layer_specs=specs))
                 else:
-                    ready_queue.append(job)
+                    # Drop if the deadline is surely unachievable: even with every
+                    # available array the remaining layers cannot finish in time.
+                    time_left = job.request.deadline_cycle - current_cycle
+                    if time_left < min_remaining_cycles(job, num_workers):
+                        scheduled.append(
+                            ScheduledRequest(
+                                request=job.request,
+                                worker_id=job.n_arrays,
+                                start_cycle=job.job_start_cycle,
+                                finish_cycle=current_cycle,
+                                slack_at_dispatch=time_left,
+                                array_cycles=job.array_cycles,
+                                dropped=True,
+                            )
+                        )
+                    else:
+                        ready_queue.append(job)
             else:
                 still_active.append((finish_cycle, job))
         active_jobs = still_active
@@ -562,9 +772,12 @@ def summarize_run(
     duration_cycles: int,
     num_workers: int,
 ) -> Dict[str, float]:
-    response_cycles = [item.finish_cycle - item.request.release_cycle for item in scheduled]
-    wait_cycles = [item.start_cycle - item.request.release_cycle for item in scheduled]
-    deadline_misses = sum(1 for item in scheduled if item.finish_cycle > item.request.deadline_cycle)
+    completed = [item for item in scheduled if not item.dropped]
+    dropped_items = [item for item in scheduled if item.dropped]
+
+    response_cycles = [item.finish_cycle - item.request.release_cycle for item in completed]
+    wait_cycles = [item.start_cycle - item.request.release_cycle for item in completed]
+    deadline_misses = sum(1 for item in completed if item.finish_cycle > item.request.deadline_cycle)
     # Use actual array-cycles consumed if tracked (layer scheduler), else fall back to
     # service_cycles × 1 array (model scheduler).
     total_busy_cycles = sum(
@@ -574,13 +787,17 @@ def summarize_run(
     last_finish = max((item.finish_cycle for item in scheduled), default=0)
     horizon_cycles = max(duration_cycles, last_finish)
 
+    n_total = len(scheduled)
+    n_completed = len(completed)
     response_cycles_sorted = sorted(response_cycles)
     wait_cycles_sorted = sorted(wait_cycles)
     summary = {
-        "arrivals": len(scheduled),
-        "completions": len(scheduled),
+        "arrivals": n_total,
+        "completions": n_completed,
+        "drops": len(dropped_items),
         "deadline_misses": deadline_misses,
-        "miss_rate": (deadline_misses / len(scheduled)) if scheduled else 0.0,
+        "miss_rate": (deadline_misses / n_completed) if n_completed else 0.0,
+        "drop_rate": (len(dropped_items) / n_total) if n_total else 0.0,
         "mean_response_cycles": (sum(response_cycles) / len(response_cycles)) if response_cycles else 0.0,
         "p95_response_cycles": percentile(response_cycles_sorted, 0.95),
         "max_response_cycles": max(response_cycles, default=0),
@@ -618,6 +835,8 @@ def write_trace_csv(
         "slack_at_dispatch_cycles",
         "array_cycles",
         "deadline_miss",
+        "dropped",
+        "mode",
         "release_s",
         "start_s",
         "finish_s",
@@ -650,6 +869,8 @@ def write_trace_csv(
                     "slack_at_dispatch_cycles": item.slack_at_dispatch,
                     "array_cycles": item.array_cycles,
                     "deadline_miss": deadline_miss,
+                    "dropped": int(item.dropped),
+                    "mode": item.request.mode,
                     "release_s": f"{cycles_to_seconds(item.request.release_cycle, cycles_per_second):.9f}",
                     "start_s": f"{cycles_to_seconds(item.start_cycle, cycles_per_second):.9f}",
                     "finish_s": f"{cycles_to_seconds(item.finish_cycle, cycles_per_second):.9f}",
@@ -676,8 +897,10 @@ def write_summary_csv(
         "cycles_per_second",
         "arrivals",
         "completions",
+        "drops",
         "deadline_misses",
         "miss_rate",
+        "drop_rate",
         "mean_response_cycles",
         "p95_response_cycles",
         "max_response_cycles",
@@ -726,7 +949,9 @@ def write_model_logs(
 
     for model, reqs in sorted(models.items()):
         log_path = output_dir / f"{output_prefix}_{model}_log.txt"
-        misses = sum(1 for r in reqs if result_by_id[r.request_id].finish_cycle > r.deadline_cycle)
+        drops = sum(1 for r in reqs if result_by_id[r.request_id].dropped)
+        completed_reqs = [r for r in reqs if not result_by_id[r.request_id].dropped]
+        misses = sum(1 for r in completed_reqs if result_by_id[r.request_id].finish_cycle > r.deadline_cycle)
 
         with log_path.open("w") as f:
             # Header
@@ -737,10 +962,16 @@ def write_model_logs(
             f.write(f"  POLICY       : {policy}\n")
             f.write(f"  CLOCK        : {cycles_per_second/1e6:.0f} MHz\n")
             f.write(f"  TOTAL REQS   : {len(reqs)}\n")
-            f.write(f"  DEADLINE MISS: {misses} / {len(reqs)} ({misses/len(reqs)*100:.1f}%)\n")
+            f.write(f"  DROPPED      : {drops} / {len(reqs)} ({drops/len(reqs)*100:.1f}%)\n")
+            miss_pct = (misses / len(completed_reqs) * 100) if completed_reqs else float("nan")
+            f.write(f"  DEADLINE MISS: {misses} / {len(completed_reqs)} ({miss_pct:.1f}% of completed)\n")
             first = reqs[0]
+            f.write(f"  MODE         : {first.mode}\n")
             f.write(f"  SERVICE TIME : {_cy(first.service_cycles)}\n")
-            f.write(f"  DEADLINE WIN : {_cy(int(first.deadline_scale * cycles_per_second / first.fps))}\n")
+            if first.mode == "throughput":
+                f.write(f"  DEADLINE WIN : n/a (throughput task)\n")
+            else:
+                f.write(f"  DEADLINE WIN : {_cy(int(first.deadline_scale * cycles_per_second / first.fps))}\n")
             f.write("=" * 80 + "\n\n")
 
             # Request trace
@@ -769,14 +1000,22 @@ def write_model_logs(
                     f"{'MISS' if miss else 'ok':>4}\n"
                 )
 
-            # Per-model summary stats
-            waits = [result_by_id[r.request_id].start_cycle - r.release_cycle for r in reqs]
-            responses = [result_by_id[r.request_id].finish_cycle - r.release_cycle for r in reqs]
+            # Per-model summary stats (completed requests only)
+            waits = [result_by_id[r.request_id].start_cycle - r.release_cycle for r in completed_reqs]
+            responses = [result_by_id[r.request_id].finish_cycle - r.release_cycle for r in completed_reqs]
             f.write("\n--- MODEL SUMMARY ---\n")
-            f.write(f"  mean wait    : {_cy(int(sum(waits)/len(waits)))}\n")
-            f.write(f"  max wait     : {_cy(max(waits))}\n")
-            f.write(f"  mean response: {_cy(int(sum(responses)/len(responses)))}\n")
-            f.write(f"  max response : {_cy(max(responses))}\n")
+            if waits:
+                f.write(f"  mean wait    : {_cy(int(sum(waits)/len(waits)))}\n")
+                f.write(f"  max wait     : {_cy(max(waits))}\n")
+            else:
+                f.write(f"  mean wait    : n/a (all dropped)\n")
+                f.write(f"  max wait     : n/a\n")
+            if responses:
+                f.write(f"  mean response: {_cy(int(sum(responses)/len(responses)))}\n")
+                f.write(f"  max response : {_cy(max(responses))}\n")
+            else:
+                f.write(f"  mean response: n/a (all dropped)\n")
+                f.write(f"  max response : n/a\n")
 
 
 def print_run_summary(
@@ -820,11 +1059,12 @@ def main() -> int:
 
     if fold_specs_table.keys() >= models_needed:
         scheduled, _ = simulate_scheduler_layer(
-            requests, fold_specs_table, num_workers, args.policy, args.alloc
+            requests, fold_specs_table, num_workers, args.policy, args.alloc,
+            duration_cycles=duration_cycles,
         )
         scheduler_mode = f"layer/{args.alloc}"
     else:
-        scheduled, _ = simulate_scheduler(requests, num_workers, args.policy)
+        scheduled, _ = simulate_scheduler(requests, num_workers, args.policy, duration_cycles)
         scheduler_mode = "model"
 
     if not args.quiet:
