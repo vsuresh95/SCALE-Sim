@@ -16,14 +16,19 @@ from iso_area import DEFAULT_MODELS, build_iso_area_summary
 
 
 HARDWARE_CONFIGS = {
-    "mono128": {"num_workers": 1, "latency_field": "lat_128"},
-    "comp4x64": {"num_workers": 4, "latency_field": "lat_64"},
-    "comp16x32": {"num_workers": 16, "latency_field": "lat_32"},
-    "comp64x16": {"num_workers": 64, "latency_field": "lat_16"},
+    "mono128":   {"num_workers": 1,  "latency_field": "lat_128", "pools": None},
+    "comp4x64":  {"num_workers": 4,  "latency_field": "lat_64",  "pools": None},
+    "comp16x32": {"num_workers": 16, "latency_field": "lat_32",  "pools": None},
+    "comp64x16": {"num_workers": 64, "latency_field": "lat_16",  "pools": None},
+    # Heterogeneous configs — iso-area with mono128 (16384 PEs total each).
+    # pools: {sa_size: count}; latency_field selects the nominal service-time column
+    # used for deadline/request-generation (largest pool → most optimistic estimate).
+    "hetero1":   {"num_workers": 37, "latency_field": "lat_64",  "pools": {64: 1, 32: 4, 16: 32}},
+    "hetero2":   {"num_workers": 22, "latency_field": "lat_64",  "pools": {64: 2, 32: 4, 16: 16}},
 }
 
 SUPPORTED_POLICIES = {"fifo", "lpt", "deadline_task_aware"}
-SUPPORTED_ALLOC = {"greedy", "fair", "deadline_fold"}
+SUPPORTED_ALLOC = {"greedy", "fair", "deadline_fold", "hetero_affinity_deadline"}
 SA_SIZE_FROM_LATENCY = {"lat_128": 128, "lat_64": 64, "lat_32": 32, "lat_16": 16}
 
 # Sentinel deadline for throughput-mode tasks: effectively no deadline.
@@ -124,6 +129,17 @@ def parse_args() -> argparse.Namespace:
         choices=sorted(SUPPORTED_ALLOC),
         default="greedy",
         help="Array allocation policy for layer-granularity scheduler.",
+    )
+    parser.add_argument(
+        "--affinity-weight",
+        type=float,
+        default=0.5,
+        metavar="W",
+        help=(
+            "Pool-selection weight for heterogeneous configs (0–1). "
+            "1.0 = pure PE-efficiency affinity; 0.0 = pure deadline urgency. "
+            "Only used when --hardware is hetero1 or hetero2."
+        ),
     )
     parser.add_argument(
         "--quiet",
@@ -393,6 +409,29 @@ def min_remaining_cycles(job: "ActiveJob", max_arrays: int) -> float:
         math.ceil(spec.fold_count / min(max_arrays, spec.fold_count)) * spec.fold_cycles
         for spec in job.layer_specs[job.current_layer_idx:]
     )
+
+
+@dataclass
+class ActiveHeteroJob:
+    """Like ActiveJob but carries fold specs for every SA size in the hetero pool."""
+    request: Request
+    multi_specs: Dict[int, List[LayerSpec]]  # {sa_size: [LayerSpec per layer]}
+    pool_sizes: List[int]                    # sorted descending, e.g. [64, 32, 16]
+    current_layer_idx: int = 0
+    job_start_cycle: int = 0
+    layer_start_cycle: int = 0
+    n_arrays: int = 0
+    assigned_pool: int = 0                   # SA size of the pool used for current layer
+    array_cycles: int = 0
+    pe_array_cycles: int = 0
+    _rem_cycles: float = field(default=0.0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Optimistic remaining time: use largest (fastest) pool's specs.
+        largest = self.pool_sizes[0]
+        self._rem_cycles = sum(
+            s.fold_count * s.fold_cycles for s in self.multi_specs[largest]
+        )
 
 
 def _is_tp(req: Request) -> int:
@@ -770,6 +809,287 @@ def simulate_scheduler_layer(
     return scheduled, final_cycle
 
 
+def load_fold_specs_multi(
+    results_root: Path,
+    model: str,
+    sa_sizes: Iterable[int],
+) -> Optional[Dict[int, List[LayerSpec]]]:
+    """Load LayerSpec lists for every SA size needed by a hetero config."""
+    result: Dict[int, List[LayerSpec]] = {}
+    for sa_size in sa_sizes:
+        specs = load_fold_specs(results_root, model, sa_size)
+        if specs is None:
+            return None
+        result[sa_size] = specs
+    return result
+
+
+def min_remaining_cycles_hetero(
+    job: ActiveHeteroJob,
+    pool_total: Dict[int, int],
+) -> float:
+    """Optimistic lower bound: for each remaining layer use the fastest available pool."""
+    result = 0.0
+    n_layers = len(job.multi_specs[job.pool_sizes[0]])
+    for layer_idx in range(job.current_layer_idx, n_layers):
+        best = float("inf")
+        for sa_size, total in pool_total.items():
+            spec = job.multi_specs[sa_size][layer_idx]
+            n = min(max(total, 1), spec.fold_count)
+            t = math.ceil(spec.fold_count / n) * spec.fold_cycles
+            if t < best:
+                best = t
+        result += best
+    return result
+
+
+def _hetero_pool_score(
+    job: ActiveHeteroJob,
+    sa_size: int,
+    n_arrays: int,
+    spec: LayerSpec,
+    all_pool_times: Dict[int, float],
+    W_aff: float,
+    W_dl: float,
+    current_cycle: int,
+) -> float:
+    """Score for assigning job's current layer to a pool of the given SA size.
+
+    Higher = better assignment.
+    Affinity component: pe_eff on this pool (0–1, higher means PEs stay busy).
+    Deadline component: urgent jobs prefer faster pools; speed_advantage is
+    normalized so the fastest achievable time across all pools = 1.0.
+    Latency and throughput modes are distinguished in urgency calculation.
+    """
+    affinity = spec.mean_pe_eff  # 0–1
+
+    if job.request.mode == "throughput":
+        urgency = 0.0
+    else:
+        slack = job.request.deadline_cycle - current_cycle - job._rem_cycles
+        # Normalized urgency: fraction of service budget already consumed by slack deficit.
+        urgency = max(0.0, min(1.0, job.request.service_cycles / max(float(slack), 1.0)))
+
+    duration = layer_time(spec, n_arrays)
+    min_time = min(all_pool_times.values()) if all_pool_times else duration
+    # 1.0 for the fastest available pool, < 1 for slower pools.
+    speed_advantage = min_time / max(duration, 1.0)
+
+    return W_aff * affinity + W_dl * urgency * speed_advantage
+
+
+def _is_tp_hetero(job: ActiveHeteroJob) -> int:
+    return 0 if job.request.mode == "latency" else 1
+
+
+def simulate_scheduler_layer_hetero(
+    requests: List[Request],
+    fold_specs_table: Dict[str, Dict[int, List[LayerSpec]]],
+    pool_config: Dict[int, int],
+    policy: str,
+    affinity_weight: float = 0.5,
+    duration_cycles: int = 0,
+) -> Tuple[List[ScheduledRequest], int]:
+    """Layer-granularity scheduler for heterogeneous SA-size pools.
+
+    pool_config maps SA size → number of arrays, e.g. {64: 1, 32: 4, 16: 32}.
+    affinity_weight (0–1) blends pe-efficiency affinity vs. deadline urgency:
+      1.0 = pure affinity (ignore deadlines in pool selection)
+      0.0 = pure deadline urgency (always pick the fastest pool for urgent jobs)
+      0.5 = balanced (recommended starting point)
+
+    Pool selection score per (job, pool):
+      score = W_aff × pe_eff_at_pool + W_dl × urgency × speed_advantage
+    Largest pools are preferred as tiebreakers; latency jobs always beat
+    throughput jobs before score comparison.
+    """
+    W_aff = affinity_weight
+    W_dl = 1.0 - affinity_weight
+
+    pool_sizes_desc = sorted(pool_config.keys(), reverse=True)  # e.g. [64, 32, 16]
+    pool_total = dict(pool_config)           # immutable reference for drop detection
+    pool_free: Dict[int, int] = dict(pool_config)   # mutable free-array counts
+    num_workers = sum(pool_config.values())
+
+    requests_by_release = sorted(requests, key=lambda r: (r.release_cycle, r.request_id))
+    arrival_idx = 0
+    next_req_id = (max(r.request_id for r in requests) + 1) if requests else 0
+
+    ready_queue: List[ActiveHeteroJob] = []
+    active_jobs: List[Tuple[int, ActiveHeteroJob]] = []  # (finish_cycle, job)
+    scheduled: List[ScheduledRequest] = []
+    current_cycle = 0
+
+    def _start_layer(job: ActiveHeteroJob, sa_size: int, n: int) -> None:
+        spec = job.multi_specs[sa_size][job.current_layer_idx]
+        n = min(n, spec.fold_count)
+        pool_free[sa_size] -= n
+        if job.current_layer_idx == 0:
+            job.job_start_cycle = current_cycle
+        job.layer_start_cycle = current_cycle
+        job.n_arrays = n
+        job.assigned_pool = sa_size
+        duration = int(math.ceil(layer_time(spec, n)))
+        job.array_cycles += n * duration
+        job.pe_array_cycles += int(n * duration * spec.mean_pe_eff)
+        active_jobs.append((current_cycle + duration, job))
+
+    def _dispatch() -> None:
+        if not ready_queue:
+            return
+        if all(v == 0 for v in pool_free.values()):
+            return
+
+        # Build all valid (job, sa_size, n, achievable_time) candidates.
+        # Pre-compute per-job achievable times across all pools for normalization.
+        job_pool_times: Dict[int, Dict[int, float]] = {}
+        candidates = []
+        for job in ready_queue:
+            layer_idx = job.current_layer_idx
+            times: Dict[int, float] = {}
+            for sa_size in pool_sizes_desc:
+                if pool_free[sa_size] == 0:
+                    continue
+                spec = job.multi_specs[sa_size][layer_idx]
+                n = min(pool_free[sa_size], spec.fold_count)
+                if n > 0:
+                    times[sa_size] = layer_time(spec, n)
+            job_pool_times[id(job)] = times
+            for sa_size, t in times.items():
+                spec = job.multi_specs[sa_size][layer_idx]
+                n = min(pool_free[sa_size], spec.fold_count)
+                score = _hetero_pool_score(
+                    job, sa_size, n, spec, times, W_aff, W_dl, current_cycle
+                )
+                candidates.append((_is_tp_hetero(job), -score, sa_size, job, n))
+
+        if not candidates:
+            return
+
+        # Sort: latency jobs first (is_tp=0 < 1), then by descending score,
+        # then by descending sa_size so larger arrays win ties.
+        candidates.sort(key=lambda c: (c[0], c[1], -c[2]))
+
+        assigned: set = set()
+        for is_tp, neg_score, sa_size, job, _ in candidates:
+            jid = id(job)
+            if jid in assigned:
+                continue
+            if pool_free[sa_size] == 0:
+                continue
+            spec = job.multi_specs[sa_size][job.current_layer_idx]
+            n = min(pool_free[sa_size], spec.fold_count)
+            if n == 0:
+                continue
+            ready_queue.remove(job)
+            assigned.add(jid)
+            _start_layer(job, sa_size, n)
+
+    while arrival_idx < len(requests_by_release) or ready_queue or active_jobs:
+        # Admit arrivals
+        while (
+            arrival_idx < len(requests_by_release)
+            and requests_by_release[arrival_idx].release_cycle <= current_cycle
+        ):
+            req = requests_by_release[arrival_idx]
+            arrival_idx += 1
+            multi = fold_specs_table.get(req.model)
+            if multi is None:
+                continue
+            ready_queue.append(
+                ActiveHeteroJob(request=req, multi_specs=multi, pool_sizes=pool_sizes_desc)
+            )
+
+        # Process layer completions
+        still_active: List[Tuple[int, ActiveHeteroJob]] = []
+        for finish_cycle, job in active_jobs:
+            if finish_cycle <= current_cycle:
+                pool_free[job.assigned_pool] += job.n_arrays
+                # Decrement _rem_cycles using largest-pool specs (optimistic estimate).
+                completed_spec_64 = job.multi_specs[pool_sizes_desc[0]][job.current_layer_idx]
+                job._rem_cycles -= completed_spec_64.fold_count * completed_spec_64.fold_cycles
+                job.current_layer_idx += 1
+                n_layers = len(job.multi_specs[pool_sizes_desc[0]])
+                if job.current_layer_idx >= n_layers:
+                    scheduled.append(
+                        ScheduledRequest(
+                            request=job.request,
+                            worker_id=job.assigned_pool,
+                            start_cycle=job.job_start_cycle,
+                            finish_cycle=finish_cycle,
+                            slack_at_dispatch=job.request.deadline_cycle - finish_cycle,
+                            array_cycles=job.array_cycles,
+                            pe_array_cycles=job.pe_array_cycles,
+                        )
+                    )
+                    # Chain next autoregressive throughput step.
+                    if (
+                        job.request.mode == "throughput"
+                        and job.request.burst_remaining > 0
+                        and duration_cycles > 0
+                        and finish_cycle < duration_cycles
+                    ):
+                        multi = fold_specs_table.get(job.request.model)
+                        if multi is not None:
+                            new_req = Request(
+                                request_id=next_req_id,
+                                model=job.request.model,
+                                release_cycle=finish_cycle,
+                                deadline_cycle=THROUGHPUT_NO_DEADLINE,
+                                service_cycles=job.request.service_cycles,
+                                task_priority=job.request.task_priority,
+                                fps=0.0,
+                                deadline_scale=0.0,
+                                mode="throughput",
+                                burst_remaining=job.request.burst_remaining - 1,
+                            )
+                            next_req_id += 1
+                            ready_queue.append(
+                                ActiveHeteroJob(
+                                    request=new_req,
+                                    multi_specs=multi,
+                                    pool_sizes=pool_sizes_desc,
+                                )
+                            )
+                else:
+                    # Drop if deadline is surely unachievable even with all arrays.
+                    time_left = job.request.deadline_cycle - current_cycle
+                    if time_left < min_remaining_cycles_hetero(job, pool_total):
+                        scheduled.append(
+                            ScheduledRequest(
+                                request=job.request,
+                                worker_id=job.assigned_pool,
+                                start_cycle=job.job_start_cycle,
+                                finish_cycle=current_cycle,
+                                slack_at_dispatch=time_left,
+                                array_cycles=job.array_cycles,
+                                pe_array_cycles=job.pe_array_cycles,
+                                dropped=True,
+                            )
+                        )
+                    else:
+                        ready_queue.append(job)
+            else:
+                still_active.append((finish_cycle, job))
+        active_jobs = still_active
+
+        _dispatch()
+
+        pending: List[int] = []
+        if arrival_idx < len(requests_by_release):
+            pending.append(requests_by_release[arrival_idx].release_cycle)
+        for fc, _ in active_jobs:
+            pending.append(fc)
+        if pending:
+            current_cycle = min(pending)
+        else:
+            break
+
+    final_cycle = max((item.finish_cycle for item in scheduled), default=0)
+    scheduled.sort(key=lambda item: item.request.request_id)
+    return scheduled, final_cycle
+
+
 def percentile(sorted_values: List[int], pct: float) -> float:
     if not sorted_values:
         return 0.0
@@ -1073,26 +1393,53 @@ def main() -> int:
 
     hardware_cfg = HARDWARE_CONFIGS[args.hardware]
     sa_size = SA_SIZE_FROM_LATENCY[hardware_cfg["latency_field"]]
+    pool_config: Optional[Dict[int, int]] = hardware_cfg.get("pools")
+    is_hetero = pool_config is not None
 
-    # Load fold specs for layer-granularity scheduling
     models_needed = set(r.model for r in requests)
-    fold_specs_table: Dict[str, List[LayerSpec]] = {}
-    for model in models_needed:
-        specs = load_fold_specs(args.results_root, model, sa_size)
-        if specs is not None:
-            fold_specs_table[model] = specs
-        elif not args.quiet:
-            print(f"INFO: fold specs missing for {model} sa{sa_size}, will fall back to model scheduler")
 
-    if fold_specs_table.keys() >= models_needed:
-        scheduled, _ = simulate_scheduler_layer(
-            requests, fold_specs_table, num_workers, args.policy, args.alloc,
-            duration_cycles=duration_cycles,
-        )
-        scheduler_mode = f"layer/{args.alloc}"
+    if is_hetero:
+        # Load fold specs for all SA sizes in the hetero pool.
+        hetero_specs_table: Dict[str, Dict[int, List[LayerSpec]]] = {}
+        for model in models_needed:
+            multi = load_fold_specs_multi(args.results_root, model, pool_config.keys())
+            if multi is not None:
+                hetero_specs_table[model] = multi
+            elif not args.quiet:
+                print(f"INFO: fold specs missing for {model} (hetero), will fall back to model scheduler")
+
+        if hetero_specs_table.keys() >= models_needed:
+            scheduled, _ = simulate_scheduler_layer_hetero(
+                requests,
+                hetero_specs_table,
+                pool_config,
+                args.policy,
+                affinity_weight=args.affinity_weight,
+                duration_cycles=duration_cycles,
+            )
+            scheduler_mode = f"layer/hetero_affinity_deadline(W_aff={args.affinity_weight:.2f})"
+        else:
+            scheduled, _ = simulate_scheduler(requests, num_workers, args.policy, duration_cycles)
+            scheduler_mode = "model"
     else:
-        scheduled, _ = simulate_scheduler(requests, num_workers, args.policy, duration_cycles)
-        scheduler_mode = "model"
+        # Homogeneous path (unchanged).
+        fold_specs_table: Dict[str, List[LayerSpec]] = {}
+        for model in models_needed:
+            specs = load_fold_specs(args.results_root, model, sa_size)
+            if specs is not None:
+                fold_specs_table[model] = specs
+            elif not args.quiet:
+                print(f"INFO: fold specs missing for {model} sa{sa_size}, will fall back to model scheduler")
+
+        if fold_specs_table.keys() >= models_needed:
+            scheduled, _ = simulate_scheduler_layer(
+                requests, fold_specs_table, num_workers, args.policy, args.alloc,
+                duration_cycles=duration_cycles,
+            )
+            scheduler_mode = f"layer/{args.alloc}"
+        else:
+            scheduled, _ = simulate_scheduler(requests, num_workers, args.policy, duration_cycles)
+            scheduler_mode = "model"
 
     if not args.quiet:
         print(f"INFO: scheduler_mode={scheduler_mode}")
@@ -1100,7 +1447,12 @@ def main() -> int:
     summary = summarize_run(scheduled, duration_cycles, num_workers)
 
     scenario_name = str(scenario.get("name", args.scenario.stem))
-    output_prefix = f"{scenario_name}_{args.hardware}_{args.policy}_{args.alloc}"
+    # For hetero configs encode W_aff in the alloc tag so filenames are parseable.
+    alloc_tag = (
+        f"hetero_W{int(round(args.affinity_weight * 100)):02d}"
+        if is_hetero else args.alloc
+    )
+    output_prefix = f"{scenario_name}_{args.hardware}_{args.policy}_{alloc_tag}"
     trace_path = args.output_dir / f"{output_prefix}_trace.csv"
     summary_path = args.output_dir / f"{output_prefix}_summary.csv"
 
