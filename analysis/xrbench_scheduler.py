@@ -25,6 +25,7 @@ HARDWARE_CONFIGS = {
     # used for deadline/request-generation (largest pool → most optimistic estimate).
     "hetero1":   {"num_workers": 37, "latency_field": "lat_64",  "pools": {64: 1, 32: 4, 16: 32}},
     "hetero2":   {"num_workers": 22, "latency_field": "lat_64",  "pools": {64: 2, 32: 4, 16: 16}},
+    "hetero3":   {"num_workers": 16, "latency_field": "lat_64",  "pools": {64: 2, 32: 6, 16: 8}},
 }
 
 SUPPORTED_POLICIES = {"fifo", "lpt", "deadline_task_aware"}
