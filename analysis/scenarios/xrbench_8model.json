@@ -7,7 +7,7 @@
   "random_seed": 0,
   "tasks": {
     "eyecod": {
-      "fps": 120,
+      "fps": 90,
       "task_priority": 1
     },
     "hand_pose": {
